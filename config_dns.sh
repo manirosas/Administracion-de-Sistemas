@@ -1,164 +1,168 @@
-##!/bin/bash
-
-# ===============================
-# VARIABLES GLOBALES
-# ===============================
-DNS_SERVICE="named"
-INTERFACE="enp0s8"
-ZONES_DIR="/var/lib/named"
-NAMED_CONF="/etc/named.conf"
+#!/bin/bash
 
 # ===============================
 # VALIDAR ROOT
 # ===============================
-if [[ $EUID -ne 0 ]]; then
-    echo "Ejecuta este script como root"
-    exit 1
-fi
+[[ $EUID -ne 0 ]] && echo "Ejecuta como root" && exit 1
 
 # ===============================
-# OBTENER IP DE enp0s8
+# VARIABLES
 # ===============================
-get_ip_enp0s8() {
-    ip addr show "$INTERFACE" | awk '/inet / {print $2}' | cut -d/ -f1
+DNS_SERVICE="named"
+INTERFACE="enp0s8"
+DOMAIN="reprobados.com"
+ZONE_FILE="/var/lib/named/db.$DOMAIN"
+ZONES_CONF="/etc/named.d/zonas.conf"
+SERIAL_FILE="/var/lib/named/serial.$DOMAIN"
+
+# ===============================
+# PAUSA
+# ===============================
+pause() { read -p "ENTER para continuar..."; }
+
+# ===============================
+# IP DE enp0s8
+# ===============================
+get_ip() {
+    ip addr show $INTERFACE | awk '/inet / {print $2}' | cut -d/ -f1
 }
 
 # ===============================
-# CONFIGURAR IP FIJA SI NO EXISTE
+# SERIAL
 # ===============================
-verificar_ip_fija() {
-    IP=$(get_ip_enp0s8)
-
-    if [[ -z "$IP" ]]; then
-        echo "No hay IP configurada en $INTERFACE"
-        read -p "IP estática: " IP
-        read -p "Máscara (ej. 24): " MASK
-        read -p "Gateway: " GW
-
-        nmcli con mod "$INTERFACE" ipv4.method manual ipv4.addresses "$IP/$MASK" ipv4.gateway "$GW"
-        nmcli con up "$INTERFACE"
-        echo "IP configurada correctamente"
-    else
-        echo "IP detectada en $INTERFACE: $IP"
-    fi
+next_serial() {
+    [[ ! -f $SERIAL_FILE ]] && date +%Y%m%d01 > $SERIAL_FILE
+    echo $(( $(cat $SERIAL_FILE) + 1 )) | tee $SERIAL_FILE
 }
 
 # ===============================
-# INSTALACIÓN IDempotente
+# INSTALAR DNS (IDEMPOTENTE)
 # ===============================
 instalar_dns() {
-    if rpm -q bind &>/dev/null; then
-        echo "BIND ya está instalado"
-        return
-    fi
+    read -p "¿Instalar BIND9? (s/n): " r
+    [[ $r != "s" ]] && return
 
-    read -p "¿Deseas instalar BIND DNS? (s/n): " opt
-    if [[ "$opt" == "s" ]]; then
-        zypper install -y bind bind-utils bind-doc
-        systemctl enable $DNS_SERVICE
-        systemctl start $DNS_SERVICE
-        echo "BIND instalado y activo"
-    else
-        echo "Instalación cancelada"
-    fi
+    rpm -q bind &>/dev/null || zypper install -y bind bind-utils
+
+    systemctl stop systemd-resolved 2>/dev/null
+    systemctl disable systemd-resolved 2>/dev/null
+
+    cat <<EOF > /etc/resolv.conf
+nameserver 127.0.0.1
+nameserver 8.8.8.8
+EOF
+
+    systemctl enable named
+    systemctl start named
+
+    echo "DNS instalado y activo"
 }
 
 # ===============================
 # CREAR ZONA
 # ===============================
 crear_zona() {
-    read -p "Dominio (ej. reprobados.com): " DOMAIN
-    read -p "IP destino del dominio: " TARGET_IP
+    IP=$(get_ip)
+    [[ -z $IP ]] && echo "enp0s8 sin IP" && return
 
-    ZONE_FILE="$ZONES_DIR/db.$DOMAIN"
+    grep -q "$DOMAIN" $ZONES_CONF 2>/dev/null && echo "Zona ya existe" && return
 
-    if grep -q "zone \"$DOMAIN\"" "$NAMED_CONF"; then
-        echo "La zona ya existe"
-        return
-    fi
-
-    cat <<EOF >> "$NAMED_CONF"
-
-zone "$DOMAIN" IN {
+    cat <<EOF >> $ZONES_CONF
+zone "$DOMAIN" {
     type master;
-    file "db.$DOMAIN";
+    file "$ZONE_FILE";
 };
 EOF
 
-    SERIAL=$(date +%Y%m%d01)
+    SERIAL=$(next_serial)
 
-    cat <<EOF > "$ZONE_FILE"
+    cat <<EOF > $ZONE_FILE
 \$TTL 86400
-@   IN  SOA ns1.$DOMAIN. admin.$DOMAIN. (
-        $SERIAL
-        3600
-        1800
-        604800
-        86400 )
+@ IN SOA ns1.$DOMAIN. admin.$DOMAIN. (
+$SERIAL
+3600
+1800
+604800
+86400 )
 
-@       IN  NS      ns1.$DOMAIN.
-ns1     IN  A       $TARGET_IP
-@       IN  A       $TARGET_IP
-www     IN  A       $TARGET_IP
+@   IN NS ns1.$DOMAIN.
+ns1 IN A  $IP
+@   IN A  $IP
+www IN CNAME @
 EOF
 
-    validar_dns
+    chown named:named $ZONE_FILE
+    named-checkconf && named-checkzone $DOMAIN $ZONE_FILE && systemctl restart named
+
+    echo "Zona $DOMAIN creada"
 }
 
 # ===============================
-# ELIMINAR ZONA
+# ALTA REGISTRO
 # ===============================
-eliminar_zona() {
-    read -p "Dominio a eliminar: " DOMAIN
+alta_registro() {
+    [[ ! -f $ZONE_FILE ]] && echo "Zona no existe" && return
 
-    sed -i "/zone \"$DOMAIN\"/,/};/d" "$NAMED_CONF"
-    rm -f "$ZONES_DIR/db.$DOMAIN"
+    read -p "Nombre (ej. host): " NAME
+    read -p "IP destino: " IP
 
-    validar_dns
+    grep -q "^$NAME" $ZONE_FILE && echo "Registro existe" && return
+
+    echo "$NAME IN A $IP" >> $ZONE_FILE
+    next_serial > /dev/null
+
+    named-checkzone $DOMAIN $ZONE_FILE && systemctl restart named
+    echo "Registro agregado"
 }
 
 # ===============================
-# CONSULTAR DOMINIO
+# BAJA REGISTRO
 # ===============================
-consultar_dominio() {
-    read -p "Dominio a consultar: " DOMAIN
-    nslookup "$DOMAIN" $(get_ip_enp0s8)
+baja_registro() {
+    [[ ! -f $ZONE_FILE ]] && echo "Zona no existe" && return
+
+    read -p "Registro a eliminar: " NAME
+    sed -i "/^$NAME /d" $ZONE_FILE
+
+    next_serial > /dev/null
+    named-checkzone $DOMAIN $ZONE_FILE && systemctl restart named
+    echo "Registro eliminado"
 }
 
 # ===============================
-# VALIDAR Y REINICIAR DNS
+# CONSULTAR ZONA
 # ===============================
-validar_dns() {
-    if named-checkconf; then
-        systemctl restart $DNS_SERVICE
-        echo "DNS configurado correctamente"
-    else
-        echo "Error en configuración DNS"
-    fi
+consultar() {
+    [[ ! -f $ZONE_FILE ]] && echo "Zona no existe" && return
+    cat $ZONE_FILE
 }
 
 # ===============================
-# MENÚ PRINCIPAL
+# MENÚ
 # ===============================
 while true; do
+    clear
     echo "==============================="
-    echo "  SERVIDOR DNS - openSUSE"
+    echo " DNS openSUSE - BIND9"
+    echo " Dominio: $DOMAIN"
     echo "==============================="
-    echo "1) Verificar / configurar IP fija"
-    echo "2) Instalar DNS (idempotente)"
-    echo "3) Dar de alta dominio"
-    echo "4) Dar de baja dominio"
-    echo "5) Consultar dominio"
-    echo "6) Salir"
-    read -p "Opción: " OPC
+    echo "1) Instalar DNS"
+    echo "2) Crear zona"
+    echo "3) Alta registro"
+    echo "4) Baja registro"
+    echo "5) Consultar zona"
+    echo "0) Salir"
+    read -p "Opción: " op
 
-    case $OPC in
-        1) verificar_ip_fija ;;
-        2) instalar_dns ;;
-        3) crear_zona ;;
-        4) eliminar_zona ;;
-        5) consultar_dominio ;;
-        6) exit 0 ;;
+    case $op in
+        1) instalar_dns ;;
+        2) crear_zona ;;
+        3) alta_registro ;;
+        4) baja_registro ;;
+        5) consultar ;;
+        0) exit ;;
         *) echo "Opción inválida" ;;
     esac
+
+    pause
 done
