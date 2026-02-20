@@ -1,201 +1,336 @@
 #!/bin/bash
 
-[[ $EUID -ne 0 ]] && echo "Ejecuta como root" && exit 1
 
-INTERFACE="enp0s8"
-NAMED_CONF="/etc/named.conf"
-ZONES_CONF="/etc/named.d/zonas.conf"
-ZONE_DIR="/var/lib/named"
-SERIAL_DIR="/var/lib/named/serial"
+# ── Colores ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m';    GREEN='\033[0;32m';  YELLOW='\033[1;33m'
+CYAN='\033[0;36m';   BLUE='\033[0;34m';  MAGENTA='\033[0;35m'
+BOLD='\033[1m';      DIM='\033[2m';       NC='\033[0m'
 
-pause() { read -rp "ENTER para continuar..."; }
+# ── Variables de entorno ──────────────────────────────────────────────────────
+IFACE="enp0s8"                                    # Interfaz de red fija
+BIND_CONF="/etc/named.conf"                       # Config principal BIND9
+NAMED_D="/etc/named.d"                            # Directorio includes
+ZONES_FILE="${NAMED_D}/zonas_locales.conf"        # Archivo de zonas personalizadas
+ZONES_DIR="/var/lib/named/master"                 # Archivos de zona
+LOG_FILE="/var/log/dns_manager.log"               # Log del script
+DNS_SERVICE="named"                               # Nombre del servicio
+DNS_SERVER_IP=""                                  # Se detecta dinámicamente
 
-# --------------------------------------------------------------------------
-# IP
-# --------------------------------------------------------------------------
+# ── Helpers de mensaje ────────────────────────────────────────────────────────
+msg_ok()   { echo -e "${GREEN}  ✔  $*${NC}";   log "OK: $*"; }
+msg_err()  { echo -e "${RED}  ✘  $*${NC}";    log "ERR: $*"; }
+msg_warn() { echo -e "${YELLOW}  ⚠  $*${NC}"; log "WARN: $*"; }
+msg_info() { echo -e "${CYAN}  ➜  $*${NC}";   log "INFO: $*"; }
 
-get_ip() {
-    ip -4 addr show "$INTERFACE" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null; }
+
+titulo() {
+    local linea="════════════════════════════════════════════════"
+    echo -e "\n${BOLD}${BLUE}${linea}${NC}"
+    echo -e "${BOLD}${BLUE}   $*${NC}"
+    echo -e "${BOLD}${BLUE}${linea}${NC}\n"
 }
 
-es_estatica() {
-    local cfg="/etc/sysconfig/network/ifcfg-${INTERFACE}"
-    [[ -f "$cfg" ]] && grep -qi "BOOTPROTO=.static." "$cfg" && return 0
-    command -v nmcli &>/dev/null && \
-        nmcli -g IP4.METHOD con show --active 2>/dev/null | grep -qi "manual" && return 0
+subtitulo() { echo -e "\n${BOLD}${CYAN}── $* ──${NC}"; }
+
+pausar() { echo -e "\n${DIM}Presiona ENTER para continuar...${NC}"; read -r; }
+
+separador() { echo -e "${DIM}────────────────────────────────────────────────${NC}"; }
+
+# ── Verificar root ────────────────────────────────────────────────────────────
+verificar_root() {
+    [[ $EUID -ne 0 ]] && { msg_err "Ejecuta como root: sudo $0"; exit 1; }
+}
+
+# =============================================================================
+#  MÓDULO 1 ── GESTIÓN DE IP ESTÁTICA
+# =============================================================================
+
+obtener_ip_actual() {
+    ip addr show "$IFACE" 2>/dev/null \
+        | grep 'inet ' \
+        | awk '{print $2}' \
+        | cut -d'/' -f1 \
+        | head -1
+}
+
+obtener_prefijo_actual() {
+    ip addr show "$IFACE" 2>/dev/null \
+        | grep 'inet ' \
+        | awk '{print $2}' \
+        | cut -d'/' -f2 \
+        | head -1
+}
+
+obtener_gateway() {
+    ip route | grep "^default.*$IFACE" | awk '{print $3}' | head -1 \
+    || ip route | grep '^default' | awk '{print $3}' | head -1
+}
+
+verificar_ip_estatica() {
+    local cfg="/etc/sysconfig/network/ifcfg-${IFACE}"
+    if [[ -f "$cfg" ]]; then
+        grep -qi "BOOTPROTO=.static." "$cfg" && return 0
+    fi
+    # Verificar con NetworkManager
+    if command -v nmcli &>/dev/null; then
+        nmcli -g IP4.METHOD con show --active 2>/dev/null \
+            | grep -qi "manual" && return 0
+    fi
     return 1
 }
 
-validar_ip_formato() {
-    local ip="$1"
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    local IFS='.'
-    read -ra octs <<< "$ip"
-    for o in "${octs[@]}"; do
-        [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
-    done
-    return 0
+modulo_ip_fija() {
+    titulo "Verificación / Configuración de IP Estática"
+    subtitulo "Interfaz de red: ${BOLD}$IFACE${NC}"
+
+    # Verificar existencia de la interfaz
+    if ! ip link show "$IFACE" &>/dev/null; then
+        msg_err "La interfaz '$IFACE' no existe en este sistema."
+        msg_info "Interfaces disponibles:"
+        ip link show | grep '^[0-9]' | awk -F': ' '{print "  •  " $2}'
+        pausar; return 1
+    fi
+
+    local ip_actual prefijo gw
+    ip_actual=$(obtener_ip_actual)
+    prefijo=$(obtener_prefijo_actual)
+    gw=$(obtener_gateway)
+
+    echo -e "  IP actual   : ${BOLD}${ip_actual:-'Sin IP asignada'}${NC}"
+    echo -e "  Prefijo     : ${BOLD}${prefijo:-'?'}${NC}"
+    echo -e "  Gateway     : ${BOLD}${gw:-'?'}${NC}"
+    separador
+
+    if verificar_ip_estatica; then
+        msg_ok "La interfaz $IFACE ya tiene IP estática configurada."
+        DNS_SERVER_IP="$ip_actual"
+        echo -e "  IP del servidor DNS: ${GREEN}${BOLD}$DNS_SERVER_IP${NC}"
+        pausar; return 0
+    fi
+
+    msg_warn "La interfaz $IFACE usa DHCP o no tiene IP estática."
+    echo ""
+    read -rp "  ¿Configurar IP estática ahora? (s/n): " resp
+    [[ ! "$resp" =~ ^[Ss]$ ]] && {
+        msg_warn "Se usará la IP dinámica actual: ${ip_actual:-'ninguna'}"
+        DNS_SERVER_IP="${ip_actual:-'127.0.0.1'}"
+        pausar; return 0
+    }
+
+    _solicitar_y_aplicar_ip "$ip_actual" "$prefijo" "$gw"
 }
 
-configurar_ip() {
-    local ip_act pfx gw dns_ext
-    ip_act=$(get_ip)
+_solicitar_y_aplicar_ip() {
+    local ip_sug="$1" pfx_sug="$2" gw_sug="$3"
+    local nueva_ip nuevo_pfx nuevo_gw nuevo_dns_ext
 
     echo ""
-    echo "Interfaz : $INTERFACE"
-    echo "IP actual: ${ip_act:-ninguna}"
-    echo ""
+    subtitulo "Ingresa los nuevos datos de red"
 
-    if ! ip link show "$INTERFACE" &>/dev/null; then
-        echo "ERROR: La interfaz $INTERFACE no existe."
-        echo "Interfaces disponibles:"
-        ip link show | grep '^[0-9]' | awk -F': ' '{print "  " $2}'
-        return 1
-    fi
-
-    if es_estatica; then
-        echo "La interfaz ya tiene IP estatica: $ip_act"
-        return 0
-    fi
-
-    echo "La interfaz usa DHCP."
-    read -rp "Configurar IP estatica? (s/n): " resp
-    [[ "$resp" != "s" && "$resp" != "S" ]] && return 0
-
-    echo ""
-
+    # ── IP ──
     while true; do
-        read -rp "Nueva IP [${ip_act:-192.168.1.10}]: " nueva_ip
-        nueva_ip="${nueva_ip:-${ip_act:-192.168.1.10}}"
-        validar_ip_formato "$nueva_ip" && break
-        echo "IP invalida."
+        read -rp "  Nueva IP [${ip_sug:-192.168.1.10}]: " nueva_ip
+        nueva_ip="${nueva_ip:-${ip_sug:-192.168.1.10}}"
+        _validar_ip "$nueva_ip" && break
+        msg_err "  IP inválida. Formato: xxx.xxx.xxx.xxx  Ej: 192.168.1.10"
     done
 
+    # ── Prefijo ──
     while true; do
-        read -rp "Prefijo CIDR [24]: " pfx
-        pfx="${pfx:-24}"
-        [[ "$pfx" =~ ^[0-9]+$ ]] && [[ "$pfx" -ge 8 && "$pfx" -le 30 ]] && break
-        echo "Prefijo invalido (8-30)."
+        read -rp "  Prefijo CIDR [${pfx_sug:-24}]: " nuevo_pfx
+        nuevo_pfx="${nuevo_pfx:-${pfx_sug:-24}}"
+        [[ "$nuevo_pfx" =~ ^[0-9]+$ ]] && (( nuevo_pfx >= 8 && nuevo_pfx <= 30 )) && break
+        msg_err "  Prefijo inválido. Rango válido: 8-30  Ej: 24"
     done
 
+    # ── Gateway ──
     while true; do
-        read -rp "Gateway: " gw
-        validar_ip_formato "$gw" && break
-        echo "Gateway invalido."
+        read -rp "  Gateway [${gw_sug:-192.168.1.1}]: " nuevo_gw
+        nuevo_gw="${nuevo_gw:-${gw_sug:-192.168.1.1}}"
+        _validar_ip "$nuevo_gw" && break
+        msg_err "  Gateway inválido."
     done
 
+    # ── DNS externo ──
     while true; do
-        read -rp "DNS externo [8.8.8.8]: " dns_ext
-        dns_ext="${dns_ext:-8.8.8.8}"
-        validar_ip_formato "$dns_ext" && break
-        echo "DNS invalido."
+        read -rp "  DNS externo secundario [8.8.8.8]: " nuevo_dns_ext
+        nuevo_dns_ext="${nuevo_dns_ext:-8.8.8.8}"
+        _validar_ip "$nuevo_dns_ext" && break
+        msg_err "  DNS externo inválido."
     done
 
     echo ""
-    echo "IP      : $nueva_ip/$pfx"
-    echo "Gateway : $gw"
-    echo "DNS ext : $dns_ext"
-    read -rp "Aplicar? (s/n): " conf
-    [[ "$conf" != "s" && "$conf" != "S" ]] && echo "Cancelado." && return
+    echo -e "  ${YELLOW}Resumen de configuración:${NC}"
+    echo -e "  ┌─────────────────────────────────┐"
+    echo -e "  │  IP       : ${BOLD}$nueva_ip/$nuevo_pfx${NC}"
+    echo -e "  │  Gateway  : ${BOLD}$nuevo_gw${NC}"
+    echo -e "  │  DNS ext  : ${BOLD}$nuevo_dns_ext${NC}"
+    echo -e "  └─────────────────────────────────┘"
+    read -rp "  ¿Aplicar? (s/n): " ok
+    [[ ! "$ok" =~ ^[Ss]$ ]] && { msg_info "Cancelado."; return; }
 
-    local cfg="/etc/sysconfig/network/ifcfg-${INTERFACE}"
+    local cfg="/etc/sysconfig/network/ifcfg-${IFACE}"
+
+    # Backup
     [[ -f "$cfg" ]] && cp "$cfg" "${cfg}.bak_$(date +%Y%m%d%H%M%S)"
 
     cat > "$cfg" <<EOF
+# Configurado por dns_manager_opensuse.sh - $(date)
 BOOTPROTO='static'
 STARTMODE='auto'
 IPADDR='${nueva_ip}'
-PREFIXLEN='${pfx}'
+PREFIXLEN='${nuevo_pfx}'
 EOF
 
-    echo "default ${gw} - -" > /etc/sysconfig/network/routes
+    # Gateway
+    echo "default ${nuevo_gw} - -" > /etc/sysconfig/network/routes
 
-    chattr -i /etc/resolv.conf 2>/dev/null
+    # resolv.conf
     cat > /etc/resolv.conf <<EOF
+# Generado por dns_manager_opensuse.sh
 nameserver 127.0.0.1
-nameserver ${dns_ext}
+nameserver ${nuevo_dns_ext}
 EOF
-    chattr +i /etc/resolv.conf 2>/dev/null
+    # Proteger resolv.conf de sobreescritura por DHCP
+    chattr +i /etc/resolv.conf 2>/dev/null || true
 
-    if systemctl is-active systemd-resolved &>/dev/null; then
-        systemctl stop systemd-resolved
-        systemctl disable systemd-resolved &>/dev/null
-        echo "systemd-resolved deshabilitado."
-    fi
-
+    msg_info "Aplicando configuración de red con wicked..."
     if systemctl is-active wicked &>/dev/null; then
-        wicked ifdown "$INTERFACE" &>/dev/null; sleep 1
-        wicked ifup "$INTERFACE" &>/dev/null; sleep 3
+        wicked ifdown "$IFACE" &>/dev/null
+        sleep 1
+        wicked ifup "$IFACE" &>/dev/null
+        sleep 3
     elif command -v nmcli &>/dev/null; then
         nmcli connection reload
-        nmcli connection up "$INTERFACE" &>/dev/null; sleep 2
+        nmcli connection up "$IFACE" &>/dev/null
+        sleep 2
     else
-        ip addr flush dev "$INTERFACE"
-        ip addr add "${nueva_ip}/${pfx}" dev "$INTERFACE"
-        ip link set "$INTERFACE" up
-        ip route add default via "$gw" 2>/dev/null
+        ip addr flush dev "$IFACE"
+        ip addr add "${nueva_ip}/${nuevo_pfx}" dev "$IFACE"
+        ip link set "$IFACE" up
+        ip route add default via "$nuevo_gw"
     fi
 
-    local check
-    check=$(get_ip)
-    [[ "$check" == "$nueva_ip" ]] \
-        && echo "IP aplicada: $nueva_ip/$pfx" \
-        || echo "Configuracion guardada. Verifica con: ip addr show $INTERFACE"
-}
-
-# --------------------------------------------------------------------------
-# Serial
-# --------------------------------------------------------------------------
-
-next_serial() {
-    local domain="$1"
-    local file="$SERIAL_DIR/$domain.serial"
-    mkdir -p "$SERIAL_DIR"
-    if [[ ! -f "$file" ]]; then
-        date +%Y%m%d01 > "$file"
+    local ip_check
+    ip_check=$(obtener_ip_actual)
+    if [[ "$ip_check" == "$nueva_ip" ]]; then
+        msg_ok "IP estática aplicada: ${nueva_ip}/${nuevo_pfx}"
     else
-        echo $(( $(cat "$file") + 1 )) > "$file"
+        msg_warn "La IP puede tardar en sincronizarse. IP vista: ${ip_check:-'ninguna'}"
+        msg_info "Tip: ejecuta 'ip addr show $IFACE' para verificar."
     fi
-    cat "$file"
+
+    DNS_SERVER_IP="$nueva_ip"
+    log "IP estática configurada: $nueva_ip/$nuevo_pfx gw=$nuevo_gw en $IFACE"
+    pausar
 }
 
-# --------------------------------------------------------------------------
-# Instalacion
-# --------------------------------------------------------------------------
+_validar_ip() {
+    local ip="$1"
+    local regex='^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+    [[ "$ip" =~ $regex ]]
+}
 
-instalar_dns() {
-    if rpm -q bind &>/dev/null; then
-        echo "BIND ya esta instalado."
-    else
+# =============================================================================
+#  MÓDULO 2 ── INSTALACIÓN IDEMPOTENTE DE BIND9
+# =============================================================================
+
+modulo_instalar() {
+    titulo "Instalación Idempotente de BIND9"
+
+    subtitulo "Verificando paquetes"
+    local paquetes_requeridos=("bind" "bind-utils")
+    local instalar=()
+
+    for pkg in "${paquetes_requeridos[@]}"; do
+        if rpm -q "$pkg" &>/dev/null; then
+            msg_ok "$pkg ya está instalado."
+        else
+            msg_warn "$pkg NO está instalado."
+            instalar+=("$pkg")
+        fi
+    done
+
+    if [[ ${#instalar[@]} -gt 0 ]]; then
+        msg_info "Instalando: ${instalar[*]}"
         zypper --non-interactive refresh
-        zypper --non-interactive install -y bind bind-utils || exit 1
-        echo "BIND instalado."
+        zypper --non-interactive install -y "${instalar[@]}"
+        if [[ $? -eq 0 ]]; then
+            msg_ok "Paquetes instalados correctamente."
+        else
+            msg_err "Error al instalar paquetes. Verifica repositorios con: zypper repos"
+            pausar; return 1
+        fi
     fi
 
-    mkdir -p /etc/named.d "$ZONE_DIR" "$SERIAL_DIR"
-    chown -R named:named "$ZONE_DIR" 2>/dev/null
-    [[ ! -f "$ZONES_CONF" ]] && touch "$ZONES_CONF"
+    subtitulo "Configurando estructura de directorios"
+    mkdir -p "$NAMED_D" "$ZONES_DIR"
+    chown -R named:named "$ZONES_DIR" 2>/dev/null || true
 
-    local old="/etc/named.d/zonas_locales.conf"
-    if [[ -f "$old" ]] && grep -q 'zone "' "$old" 2>/dev/null; then
-        > "$old"
-        echo "Archivo de zonas anterior vaciado."
+    # Crear archivo de zonas locales si no existe
+    [[ ! -f "$ZONES_FILE" ]] && touch "$ZONES_FILE" && msg_ok "Creado: $ZONES_FILE"
+
+    # Asegurar que named.conf incluya nuestras zonas
+    _configurar_named_conf
+
+    subtitulo "Verificando servicio named"
+    if systemctl is-active "$DNS_SERVICE" &>/dev/null; then
+        msg_ok "El servicio '$DNS_SERVICE' ya está activo."
+    else
+        msg_info "Habilitando e iniciando el servicio..."
+        systemctl enable "$DNS_SERVICE" &>/dev/null
+        systemctl start "$DNS_SERVICE"
+        sleep 2
+        if systemctl is-active "$DNS_SERVICE" &>/dev/null; then
+            msg_ok "Servicio '$DNS_SERVICE' iniciado."
+        else
+            msg_err "No se pudo iniciar el servicio."
+            msg_info "Diagnóstico: journalctl -u named -n 30"
+        fi
     fi
 
-    _crear_archivos_base
+    subtitulo "Configurando Firewall"
+    _configurar_firewall
 
-    if ! grep -q "zonas.conf" "$NAMED_CONF" 2>/dev/null; then
-        [[ -f "$NAMED_CONF" ]] && cp "$NAMED_CONF" "${NAMED_CONF}.bak_$(date +%Y%m%d%H%M%S)"
-        cat > "$NAMED_CONF" <<EOF
+    pausar
+}
+
+_configurar_named_conf() {
+    local include_line='include "/etc/named.d/zonas_locales.conf";'
+
+    if grep -q "zonas_locales.conf" "$BIND_CONF" 2>/dev/null; then
+        msg_ok "named.conf ya referencia las zonas locales."
+        return
+    fi
+
+    if [[ -f "$BIND_CONF" ]]; then
+        cp "$BIND_CONF" "${BIND_CONF}.bak_$(date +%Y%m%d%H%M%S)"
+        echo -e "\n// === Zonas personalizadas (dns_manager) ===\n${include_line}" >> "$BIND_CONF"
+        msg_ok "Include agregado a $BIND_CONF"
+    else
+        msg_info "Generando $BIND_CONF desde plantilla..."
+        cat > "$BIND_CONF" <<'NAMEDCONF'
+# /etc/named.conf - Generado por dns_manager_opensuse.sh
 options {
-    directory "$ZONE_DIR";
-    listen-on port 53 { any; };
-    listen-on-v6 { any; };
-    allow-query { any; };
-    allow-recursion { localhost; localnets; };
-    recursion yes;
-    forwarders { 8.8.8.8; 8.8.4.4; };
-    dnssec-validation no;
+    directory           "/var/lib/named";
+    dump-file           "/var/log/named_dump.db";
+    statistics-file     "/var/log/named.stats";
+    pid-file            "/run/named/named.pid";
+
+    listen-on           { any; };
+    listen-on-v6        { any; };
+
+    allow-query         { any; };
+    allow-recursion     { localhost; localnets; };
+    recursion           yes;
+
+    forwarders {
+        8.8.8.8;
+        8.8.4.4;
+    };
+
+    dnssec-validation   no;
 };
 
 logging {
@@ -203,8 +338,11 @@ logging {
         file "/var/log/named.log" versions 3 size 5m;
         severity dynamic;
         print-time yes;
+        print-severity yes;
+        print-category yes;
     };
     category default { default_log; };
+    category queries  { default_log; };
 };
 
 zone "." IN {
@@ -224,511 +362,647 @@ zone "0.0.127.in-addr.arpa" IN {
     notify no;
 };
 
-include "$ZONES_CONF";
-EOF
-        echo "named.conf generado."
-    else
-        sed -i 's/dnssec-validation yes/dnssec-validation no/' "$NAMED_CONF"
-        sed -i 's/dnssec-validation auto/dnssec-validation no/' "$NAMED_CONF"
-        sed -i '/zonas_locales/d' "$NAMED_CONF"
-        echo "named.conf actualizado."
+// === Zonas personalizadas (dns_manager) ===
+include "/etc/named.d/zonas_locales.conf";
+NAMEDCONF
+        msg_ok "named.conf generado."
     fi
+}
 
-    if systemctl is-active systemd-resolved &>/dev/null; then
-        systemctl stop systemd-resolved
-        systemctl disable systemd-resolved &>/dev/null
-        echo "systemd-resolved deshabilitado."
-    fi
-
+_configurar_firewall() {
     if command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null; then
         firewall-cmd --permanent --add-service=dns &>/dev/null
         firewall-cmd --reload &>/dev/null
-        echo "Puerto 53 abierto."
-    fi
-
-    systemctl enable named &>/dev/null
-    systemctl restart named
-    sleep 2
-    systemctl is-active named &>/dev/null \
-        && echo "Servicio named activo." \
-        || echo "ERROR: named no inicio. Revisa: journalctl -u named -n 30"
-}
-
-_crear_archivos_base() {
-    if [[ ! -f "$ZONE_DIR/root.hint" ]]; then
-        cat > "$ZONE_DIR/root.hint" <<'EOF'
-.   3600000  IN  NS  A.ROOT-SERVERS.NET.
-A.ROOT-SERVERS.NET.  3600000  A  198.41.0.4
-B.ROOT-SERVERS.NET.  3600000  A  199.9.14.201
-C.ROOT-SERVERS.NET.  3600000  A  192.33.4.12
-D.ROOT-SERVERS.NET.  3600000  A  199.7.91.13
-M.ROOT-SERVERS.NET.  3600000  A  202.12.27.33
-EOF
-        chown named:named "$ZONE_DIR/root.hint"
-        echo "root.hint creado."
-    fi
-
-    if [[ ! -f "$ZONE_DIR/localhost.zone" ]]; then
-        cat > "$ZONE_DIR/localhost.zone" <<'EOF'
-$TTL 1D
-@  IN  SOA  localhost. root.localhost. ( 2025010101 1D 1H 1W 1D )
-@  IN  NS   localhost.
-@  IN  A    127.0.0.1
-EOF
-        chown named:named "$ZONE_DIR/localhost.zone"
-        echo "localhost.zone creado."
-    fi
-
-    if [[ ! -f "$ZONE_DIR/127.0.0.zone" ]]; then
-        cat > "$ZONE_DIR/127.0.0.zone" <<'EOF'
-$TTL 1D
-@  IN  SOA  localhost. root.localhost. ( 2025010101 1D 1H 1W 1D )
-@  IN  NS   localhost.
-1  IN  PTR  localhost.
-EOF
-        chown named:named "$ZONE_DIR/127.0.0.zone"
-        echo "127.0.0.zone creado."
+        msg_ok "Puerto 53/TCP y 53/UDP abiertos en firewalld."
+    elif systemctl is-active SuSEfirewall2 &>/dev/null; then
+        msg_warn "SuSEfirewall2 activo. Verifica manualmente que el puerto 53 esté abierto."
+    else
+        msg_info "No se detectó firewall activo. Puerto 53 accesible."
     fi
 }
 
-# --------------------------------------------------------------------------
-# Normalizar dominio
-# --------------------------------------------------------------------------
+# =============================================================================
+#  MÓDULO 3 ── NORMALIZACIÓN Y VALIDACIÓN DE DOMINIOS
+# =============================================================================
 
-normalizar_dominio() {
+# Quita "www." del inicio → devuelve solo el dominio raíz
+_normalizar_dominio() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^www\.//' | xargs
 }
 
-validar_dominio() {
-    echo "$1" | grep -qE '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$'
+# Nombre del archivo de zona para un dominio
+_archivo_zona() { echo "${ZONES_DIR}/db.${1}"; }
+
+# Validar formato de dominio
+_validar_dominio() {
+    local d="$1"
+    [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]]
 }
 
-# --------------------------------------------------------------------------
-# Crear zona
-# --------------------------------------------------------------------------
+# =============================================================================
+#  MÓDULO 4 ── ALTA DE ZONA DNS
+# =============================================================================
 
-crear_zona() {
-    local IP
-    IP=$(get_ip)
+modulo_alta() {
+    titulo "Alta de Zona DNS"
 
-    echo ""
-    echo "IP del servidor DNS: ${IP:-no detectada}"
-    echo ""
-    echo "Ingresa el dominio. Ejemplo: miempresa.com"
-    echo "Si escribes www.dominio.com se registra como dominio.com"
-    echo ""
-
-    local entrada DOMAIN
-    while true; do
-        read -rp "Dominio: " entrada
-        entrada=$(echo "$entrada" | xargs)
-        [[ -z "$entrada" ]] && echo "El dominio no puede estar vacio." && continue
-        DOMAIN=$(normalizar_dominio "$entrada")
-        validar_dominio "$DOMAIN" && break
-        echo "Dominio invalido: '$DOMAIN'. Ejemplo valido: miempresa.com"
-    done
-
-    local ip_dest
-    while true; do
-        read -rp "IP de destino [${IP}]: " ip_dest
-        ip_dest="${ip_dest:-$IP}"
-        validar_ip_formato "$ip_dest" && break
-        echo "IP invalida."
-    done
-
-    local ZONE_FILE="$ZONE_DIR/db.$DOMAIN"
-
-    if grep -q "zone \"$DOMAIN\"" "$ZONES_CONF" 2>/dev/null; then
-        echo "La zona '$DOMAIN' ya existe."
-        read -rp "Sobreescribir? (s/n): " over
-        [[ "$over" != "s" && "$over" != "S" ]] && echo "Cancelado." && return
-        _eliminar_bloque_zona "$DOMAIN"
+    # Asegurar que tenemos la IP del servidor
+    if [[ -z "$DNS_SERVER_IP" ]]; then
+        DNS_SERVER_IP=$(obtener_ip_actual)
+        if [[ -z "$DNS_SERVER_IP" ]]; then
+            msg_err "No se pudo determinar la IP del servidor."
+            msg_info "Ejecuta primero la opción [2] para configurar la IP."
+            pausar; return 1
+        fi
     fi
 
-    cat >> "$ZONES_CONF" <<EOF
+    separador
+    echo -e "  ${CYAN}Puedes ingresar el dominio en cualquiera de estos formatos:${NC}"
+    echo -e "  • ${BOLD}reprobados.com${NC}     → se crea A + CNAME para www"
+    echo -e "  • ${BOLD}www.reprobados.com${NC} → se normaliza automáticamente"
+    separador
 
-// Zona: $DOMAIN
-zone "$DOMAIN" {
-    type master;
-    file "$ZONE_FILE";
+    # ── Pedir dominio ──
+    local entrada dominio
+    while true; do
+        echo ""
+        read -rp "  Dominio a registrar: " entrada
+        entrada=$(echo "$entrada" | xargs)
+
+        if [[ -z "$entrada" ]]; then
+            msg_err "El dominio no puede estar vacío."; continue
+        fi
+
+        dominio=$(_normalizar_dominio "$entrada")
+
+        if ! _validar_dominio "$dominio"; then
+            msg_err "Dominio inválido: '$dominio'"
+            msg_info "Formato válido: reprobados.com  |  mi-empresa.com.mx"
+            continue
+        fi
+        break
+    done
+
+    msg_info "Dominio normalizado: ${BOLD}$dominio${NC}"
+    echo -e "  Se crearán los registros:"
+    echo -e "  • ${BOLD}$dominio${NC}      →  A      →  <IP destino>"
+    echo -e "  • ${BOLD}www.$dominio${NC}  →  CNAME  →  $dominio"
+
+    # ── Pedir IP destino ──
+    local ip_destino
+    echo ""
+    while true; do
+        read -rp "  IP de destino [${DNS_SERVER_IP}]: " ip_destino
+        ip_destino="${ip_destino:-$DNS_SERVER_IP}"
+        _validar_ip "$ip_destino" && break
+        msg_err "IP inválida. Ej: 192.168.1.20"
+    done
+
+    # ── Verificar idempotencia ──
+    local archivo_z
+    archivo_z=$(_archivo_zona "$dominio")
+
+    if grep -q "\"$dominio\"" "$ZONES_FILE" 2>/dev/null; then
+        msg_warn "La zona '${dominio}' ya existe en la configuración."
+        echo ""
+        read -rp "  ¿Sobreescribir? (s/n): " sobre
+        [[ ! "$sobre" =~ ^[Ss]$ ]] && { msg_info "Operación cancelada."; pausar; return; }
+        _eliminar_zona_conf "$dominio"
+    fi
+
+    # ── Generar archivo de zona ──
+    local serial
+    serial=$(date +%Y%m%d%02d)
+    msg_info "Generando archivo de zona: $archivo_z"
+
+    cat > "$archivo_z" <<EOF
+; ══════════════════════════════════════════════════════════════
+;  Zona: $dominio
+;  Generado: $(date '+%Y-%m-%d %H:%M:%S')
+;  Servidor DNS: $DNS_SERVER_IP
+;  IP destino  : $ip_destino
+; ══════════════════════════════════════════════════════════════
+
+\$TTL 86400      ; TTL por defecto: 1 día
+
+; ── SOA (Start of Authority) ──────────────────────────────────
+@   IN  SOA  ns1.${dominio}. admin.${dominio}. (
+                ${serial}   ; Serial  (YYYYMMDDNN)
+                3600        ; Refresh (1 hora)
+                1800        ; Retry   (30 min)
+                604800      ; Expire  (1 semana)
+                86400 )     ; Minimum TTL (1 día)
+
+; ── Servidores de nombres ──────────────────────────────────────
+@       IN  NS   ns1.${dominio}.
+
+; ── Registro A: Servidor de nombres ──────────────────────────
+ns1     IN  A    ${DNS_SERVER_IP}
+
+; ── Registro A: Dominio raíz ──────────────────────────────────
+;  reprobados.com → ${ip_destino}
+@       IN  A    ${ip_destino}
+
+; ── Registro CNAME: www apunta al dominio raíz ────────────────
+;  www.reprobados.com → reprobados.com → ${ip_destino}
+www     IN  CNAME  ${dominio}.
+
+; ══════════════════════════════════════════════════════════════
+EOF
+
+    chown named:named "$archivo_z" 2>/dev/null || true
+    chmod 644 "$archivo_z"
+
+    # ── Registrar zona en zonas_locales.conf ──
+    cat >> "$ZONES_FILE" <<EOF
+
+// ── Zona: $dominio ─────────────────────────────────────────
+// Alta: $(date '+%Y-%m-%d %H:%M:%S') | IP: $ip_destino
+zone "$dominio" IN {
+    type   master;
+    file   "$archivo_z";
+    allow-update { none; };
+    allow-query  { any;  };
+    notify no;
 };
 EOF
 
-    local SERIAL
-    SERIAL=$(next_serial "$DOMAIN")
+    msg_ok "Zona registrada en $ZONES_FILE"
 
-    cat > "$ZONE_FILE" <<EOF
-\$TTL 86400
-@ IN SOA ns1.$DOMAIN. admin.$DOMAIN. (
-    $SERIAL ; Serial
-    3600    ; Refresh
-    1800    ; Retry
-    604800  ; Expire
-    86400 ) ; Minimum TTL
+    # ── Validaciones ──
+    subtitulo "Validando configuración"
 
-@   IN NS  ns1.$DOMAIN.
-ns1 IN A   $IP
-@   IN A   $ip_dest
-www IN CNAME $DOMAIN.
-EOF
-
-    chown named:named "$ZONE_FILE"
-    chmod 644 "$ZONE_FILE"
-
-    echo ""
-    named-checkconf "$NAMED_CONF" 2>&1 && echo "named-checkconf OK" || { echo "ERROR en named.conf"; return 1; }
-    named-checkzone "$DOMAIN" "$ZONE_FILE" 2>&1 && echo "named-checkzone OK" || { echo "ERROR en zona"; return 1; }
-
-    systemctl restart named
-    sleep 1
-    echo ""
-    echo "Zona '$DOMAIN' creada."
-    echo "  $DOMAIN     -> A     -> $ip_dest"
-    echo "  www.$DOMAIN -> CNAME -> $DOMAIN"
-    echo "  ns1.$DOMAIN -> A     -> $IP"
-}
-
-# --------------------------------------------------------------------------
-# Alta de registro
-# --------------------------------------------------------------------------
-
-alta_registro() {
-    echo ""
-    read -rp "Zona (dominio): " entrada
-    local DOMAIN
-    DOMAIN=$(normalizar_dominio "$entrada")
-    local ZONE_FILE="$ZONE_DIR/db.$DOMAIN"
-
-    [[ ! -f "$ZONE_FILE" ]] && echo "La zona '$DOMAIN' no existe." && return
-
-    echo "Registros actuales:"
-    grep -E '\s+(A|CNAME)\s+' "$ZONE_FILE" | grep -v '^;'
-    echo ""
-
-    read -rp "Nombre del registro (ej: mail, ftp, @ para raiz): " NAME
-
-    local HOST
-    if [[ "$NAME" == "$DOMAIN" || "$NAME" == "@" ]]; then
-        HOST="@"
+    if named-checkconf "$BIND_CONF" 2>&1; then
+        msg_ok "named-checkconf: sin errores."
     else
-        HOST="${NAME%%.$DOMAIN}"
+        msg_err "Errores en named.conf. Revisa la configuración."
+        pausar; return 1
     fi
 
-    read -rp "Tipo (A/CNAME) [A]: " tipo
-    tipo="${tipo:-A}"
-    tipo=$(echo "$tipo" | tr '[:lower:]' '[:upper:]')
-
-    if [[ "$tipo" == "A" ]]; then
-        local ip_dest
-        while true; do
-            read -rp "IP destino: " ip_dest
-            validar_ip_formato "$ip_dest" && break
-            echo "IP invalida."
-        done
-        grep -qE "^$HOST\s+IN\s+A" "$ZONE_FILE" && echo "Registro ya existe." && return
-        echo "$HOST IN A $ip_dest" >> "$ZONE_FILE"
-        [[ "$HOST" == "@" ]] && ! grep -q "^www " "$ZONE_FILE" && \
-            echo "www IN CNAME $DOMAIN." >> "$ZONE_FILE"
-    elif [[ "$tipo" == "CNAME" ]]; then
-        read -rp "Nombre canonico destino: " destino
-        grep -qE "^$HOST\s+IN\s+CNAME" "$ZONE_FILE" && echo "Registro ya existe." && return
-        echo "$HOST IN CNAME $destino." >> "$ZONE_FILE"
+    if named-checkzone "$dominio" "$archivo_z" 2>&1; then
+        msg_ok "named-checkzone: zona válida."
     else
-        echo "Tipo no soportado. Usa A o CNAME."
-        return
+        msg_err "Errores en el archivo de zona."
+        pausar; return 1
     fi
 
-    next_serial "$DOMAIN" > /dev/null
-    named-checkzone "$DOMAIN" "$ZONE_FILE" && systemctl restart named && echo "Registro agregado."
+    # ── Recargar servicio ──
+    _recargar_bind
+
+    echo ""
+    echo -e "${GREEN}${BOLD}  ✔ Zona '$dominio' creada exitosamente.${NC}"
+    separador
+    echo -e "  ${CYAN}Registros DNS configurados:${NC}"
+    echo -e "  ┌────────────────────────────────────────────────┐"
+    echo -e "  │  ${BOLD}$dominio${NC}     →  A      →  $ip_destino"
+    echo -e "  │  ${BOLD}www.$dominio${NC} →  CNAME  →  $dominio"
+    echo -e "  │  ${BOLD}ns1.$dominio${NC} →  A      →  $DNS_SERVER_IP"
+    echo -e "  └────────────────────────────────────────────────┘"
+    separador
+
+    log "Zona creada: $dominio | destino=$ip_destino | dns=$DNS_SERVER_IP"
+    pausar
 }
 
-# --------------------------------------------------------------------------
-# Baja de registro
-# --------------------------------------------------------------------------
+# =============================================================================
+#  MÓDULO 5 ── BAJA DE ZONA DNS
+# =============================================================================
 
-baja_registro() {
-    echo ""
-    read -rp "Zona (dominio): " entrada
-    local DOMAIN
-    DOMAIN=$(normalizar_dominio "$entrada")
-    local ZONE_FILE="$ZONE_DIR/db.$DOMAIN"
+modulo_baja() {
+    titulo "Baja de Zona DNS"
 
-    [[ ! -f "$ZONE_FILE" ]] && echo "La zona '$DOMAIN' no existe." && return
+    _listar_zonas_corto
+    if [[ $? -ne 0 ]]; then pausar; return; fi
 
-    echo "Registros en $DOMAIN:"
-    grep -E '\s+(A|CNAME|NS)\s+' "$ZONE_FILE" | grep -v '^;'
-    echo ""
+    local entrada dominio
+    read -rp "  Dominio a eliminar: " entrada
+    dominio=$(_normalizar_dominio "$entrada")
 
-    read -rp "Nombre del registro a eliminar (ej: mail, @ para raiz): " HOST
-
-    if ! grep -qE "^$HOST\s+" "$ZONE_FILE"; then
-        echo "No se encontro el registro '$HOST'."
-        return
+    if [[ -z "$dominio" ]]; then
+        msg_err "Dominio vacío."; pausar; return
     fi
 
-    sed -i "/^$HOST\s/d" "$ZONE_FILE"
-    [[ "$HOST" == "@" ]] && sed -i "/^www\s/d" "$ZONE_FILE"
+    if ! grep -q "\"$dominio\"" "$ZONES_FILE" 2>/dev/null; then
+        msg_err "La zona '$dominio' no existe en la configuración."
+        pausar; return
+    fi
 
-    next_serial "$DOMAIN" > /dev/null
-    named-checkzone "$DOMAIN" "$ZONE_FILE" && systemctl restart named && echo "Registro eliminado."
+    local archivo_z
+    archivo_z=$(_archivo_zona "$dominio")
+
+    echo ""
+    echo -e "  ${RED}${BOLD}⚠  Se eliminará la siguiente zona:${NC}"
+    echo -e "  ┌───────────────────────────────────────┐"
+    echo -e "  │  Dominio : ${BOLD}$dominio${NC}"
+    echo -e "  │  Archivo : $archivo_z"
+    echo -e "  └───────────────────────────────────────┘"
+    read -rp "  ¿Confirmar eliminación? (s/n): " conf
+    [[ ! "$conf" =~ ^[Ss]$ ]] && { msg_info "Cancelado."; pausar; return; }
+
+    _eliminar_zona_conf "$dominio"
+
+    # Verificar y recargar
+    if named-checkconf "$BIND_CONF" &>/dev/null; then
+        _recargar_bind
+        msg_ok "Zona '$dominio' eliminada y servicio recargado."
+    else
+        msg_err "Error en la configuración tras la baja. Verifica manualmente."
+    fi
+
+    log "Zona eliminada: $dominio"
+    pausar
 }
 
-# --------------------------------------------------------------------------
-# Eliminar bloque de zona del archivo de configuracion
-# --------------------------------------------------------------------------
+_eliminar_zona_conf() {
+    local dominio="$1"
+    local archivo_z
+    archivo_z=$(_archivo_zona "$dominio")
 
-_eliminar_bloque_zona() {
-    local dom="$1"
-    local archivos=("$ZONES_CONF" "/etc/named.d/zonas_locales.conf")
+    # Eliminar bloque del archivo de zonas con Python3
+    python3 <<PYEOF
+import re, sys
 
-    for zf in "${archivos[@]}"; do
-        [[ -f "$zf" ]] || continue
-        grep -q "\"$dom\"" "$zf" 2>/dev/null || continue
+filepath = "$ZONES_FILE"
+dominio  = "$dominio"
 
-        local linea total inicio fin
-        linea=$(grep -n "\"$dom\"" "$zf" | head -1 | cut -d: -f1)
-        [[ -z "$linea" ]] && continue
-        total=$(wc -l < "$zf")
-        inicio="$linea"
+try:
+    with open(filepath, 'r') as f:
+        content = f.read()
 
-        if [[ "$linea" -gt 1 ]]; then
-            local prev
-            prev=$(sed -n "$(( linea - 1 ))p" "$zf")
-            echo "$prev" | grep -q '^//' && inicio=$(( linea - 1 ))
+    # Patrón: desde el comentario hasta el cierre del bloque }; inclusive
+    pattern = r'// ── Zona: ' + re.escape(dominio) + r'.*?^};'
+    new_content = re.sub(pattern, '', content, flags=re.MULTILINE | re.DOTALL)
+
+    with open(filepath, 'w') as f:
+        f.write(new_content)
+    print("  Bloque de zona eliminado del archivo de configuración.")
+except Exception as e:
+    print(f"  Error: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+    # Eliminar archivo de zona
+    if [[ -f "$archivo_z" ]]; then
+        rm -f "$archivo_z"
+        msg_ok "Archivo de zona eliminado: $archivo_z"
+    fi
+}
+
+# =============================================================================
+#  MÓDULO 6 ── CONSULTA DE ZONAS DNS
+# =============================================================================
+
+_listar_zonas_corto() {
+    if [[ ! -f "$ZONES_FILE" ]] || ! grep -q 'zone "' "$ZONES_FILE" 2>/dev/null; then
+        msg_warn "No hay zonas DNS configuradas actualmente."
+        return 1
+    fi
+    echo -e "\n  ${CYAN}${BOLD}Zonas configuradas:${NC}"
+    grep 'zone "' "$ZONES_FILE" | sed 's/.*zone "\(.*\)" IN.*/  •  \1/'
+    echo ""
+    return 0
+}
+
+modulo_consultar() {
+    titulo "Consulta de Zonas DNS"
+
+    if [[ ! -f "$ZONES_FILE" ]] || ! grep -q 'zone "' "$ZONES_FILE" 2>/dev/null; then
+        msg_warn "No hay zonas DNS configuradas."
+        pausar; return
+    fi
+
+    # Extraer dominios del archivo de zonas
+    mapfile -t dominios < <(grep 'zone "' "$ZONES_FILE" | sed 's/.*zone "\(.*\)" IN.*/\1/')
+
+    echo -e "${BOLD}${CYAN}"
+    echo "  ╔══════════════════════════════════════════════════════╗"
+    echo "  ║          ZONAS DNS CONFIGURADAS                      ║"
+    echo "  ╚══════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+
+    local idx=1
+    for dom in "${dominios[@]}"; do
+        local archivo_z
+        archivo_z=$(_archivo_zona "$dom")
+
+        echo -e "  ${BOLD}[$idx] ${GREEN}$dom${NC}"
+
+        if [[ -f "$archivo_z" ]]; then
+            echo -e "       ${DIM}Archivo: $archivo_z${NC}"
+            echo -e "       ${CYAN}Registros:${NC}"
+            # Mostrar solo registros A y CNAME, excluyendo comentarios
+            while IFS= read -r linea; do
+                [[ "$linea" =~ ^\; ]] && continue
+                [[ "$linea" =~ ^$ ]] && continue
+                [[ "$linea" =~ ^\\$ ]] && continue
+                if echo "$linea" | grep -qE '\s+(A|CNAME|NS)\s+'; then
+                    echo -e "       ${DIM}→${NC} $linea"
+                fi
+            done < "$archivo_z"
+        else
+            echo -e "       ${RED}⚠ Archivo de zona no encontrado${NC}"
         fi
 
-        fin="$linea"
-        while [[ "$fin" -le "$total" ]]; do
-            sed -n "${fin}p" "$zf" | grep -qE '^\s*\};\s*$' && break
-            fin=$(( fin + 1 ))
-        done
-
-        sed -i "${inicio},${fin}d" "$zf"
-        echo "Bloque de '$dom' eliminado de $(basename "$zf")."
+        echo ""
+        ((idx++))
     done
 
-    rm -f "$ZONE_DIR/db.$dom"
-    rm -f "$SERIAL_DIR/$dom.serial"
-    echo "Archivos de zona y serial eliminados."
-}
-
-# --------------------------------------------------------------------------
-# Baja de zona completa
-# --------------------------------------------------------------------------
-
-baja_zona() {
-    echo ""
-
-    if ! grep -q 'zone "' "$ZONES_CONF" 2>/dev/null; then
-        echo "No hay zonas configuradas."
-        return
-    fi
-
-    echo "Zonas disponibles:"
-    grep 'zone "' "$ZONES_CONF" | sed 's/.*zone "\(.*\)".*/  \1/'
-    echo ""
-
-    read -rp "Dominio a eliminar: " entrada
-    local DOMAIN
-    DOMAIN=$(normalizar_dominio "$entrada")
-    [[ -z "$DOMAIN" ]] && echo "Dominio vacio." && return
-
-    if ! grep -q "\"$DOMAIN\"" "$ZONES_CONF" 2>/dev/null; then
-        echo "La zona '$DOMAIN' no existe."
-        return
-    fi
-
-    read -rp "Eliminar zona '$DOMAIN'? (s/n): " conf
-    [[ "$conf" != "s" && "$conf" != "S" ]] && echo "Cancelado." && return
-
-    _eliminar_bloque_zona "$DOMAIN"
-    named-checkconf "$NAMED_CONF" &>/dev/null && systemctl restart named
-    echo "Zona '$DOMAIN' eliminada."
-}
-
-# --------------------------------------------------------------------------
-# Consultar zona
-# --------------------------------------------------------------------------
-
-consultar_zona() {
-    echo ""
-
-    if ! grep -q 'zone "' "$ZONES_CONF" 2>/dev/null; then
-        echo "No hay zonas configuradas."
-        return
-    fi
-
-    echo "Zonas disponibles:"
-    grep 'zone "' "$ZONES_CONF" | sed 's/.*zone "\(.*\)".*/  \1/'
-    echo ""
-
-    read -rp "Dominio (ENTER para ver todos): " entrada
-
-    if [[ -z "$entrada" ]]; then
-        local doms
-        mapfile -t doms < <(grep 'zone "' "$ZONES_CONF" | sed 's/.*zone "\(.*\)".*/\1/')
-        for d in "${doms[@]}"; do
-            echo "--- $d ---"
-            local f="$ZONE_DIR/db.$d"
-            [[ -f "$f" ]] && cat "$f" || echo "  Archivo no encontrado: $f"
-            echo ""
-        done
+    separador
+    # Estado del servicio
+    echo -n "  Estado del servicio named: "
+    if systemctl is-active "$DNS_SERVICE" &>/dev/null; then
+        echo -e "${GREEN}${BOLD}ACTIVO ✔${NC}"
     else
-        local DOMAIN
-        DOMAIN=$(normalizar_dominio "$entrada")
-        local ZONE_FILE="$ZONE_DIR/db.$DOMAIN"
-        [[ ! -f "$ZONE_FILE" ]] && echo "Zona '$DOMAIN' no encontrada." && return
-        cat "$ZONE_FILE"
+        echo -e "${RED}${BOLD}INACTIVO ✘${NC}"
+    fi
+
+    # IP del servidor
+    local ip_srv
+    ip_srv=$(obtener_ip_actual)
+    echo -e "  IP del servidor DNS     : ${BOLD}${ip_srv:-'No detectada'}${NC}"
+    echo -e "  Interfaz de red         : ${BOLD}$IFACE${NC}"
+    separador
+
+    pausar
+}
+
+# =============================================================================
+#  MÓDULO 7 ── PRUEBAS DE RESOLUCIÓN
+# =============================================================================
+
+modulo_probar() {
+    titulo "Pruebas de Resolución DNS"
+
+    _listar_zonas_corto
+
+    local entrada dominio
+    read -rp "  Dominio a probar: " entrada
+    dominio=$(_normalizar_dominio "$entrada")
+
+    [[ -z "$dominio" ]] && { msg_err "Dominio vacío."; pausar; return; }
+
+    echo -e "\n${BOLD}  Iniciando pruebas para: ${GREEN}$dominio${NC}\n"
+
+    # ── 1. Verificación de sintaxis ──
+    echo -e "${YELLOW}  [1/6] named-checkconf — Verificación de sintaxis${NC}"
+    separador
+    if named-checkconf "$BIND_CONF" 2>&1 | sed 's/^/  /'; then
+        msg_ok "Sintaxis de named.conf correcta."
+    else
+        msg_err "Errores de sintaxis detectados."
+    fi
+
+    # ── 2. Verificación de zona ──
+    local archivo_z
+    archivo_z=$(_archivo_zona "$dominio")
+    echo -e "\n${YELLOW}  [2/6] named-checkzone — Verificación de archivo de zona${NC}"
+    separador
+    if [[ -f "$archivo_z" ]]; then
+        named-checkzone "$dominio" "$archivo_z" 2>&1 | sed 's/^/  /'
+        [[ ${PIPESTATUS[0]} -eq 0 ]] && msg_ok "Zona válida." || msg_err "Errores en zona."
+    else
+        msg_err "Archivo de zona no encontrado: $archivo_z"
+    fi
+
+    # ── 3. nslookup dominio raíz ──
+    echo -e "\n${YELLOW}  [3/6] nslookup $dominio @127.0.0.1${NC}"
+    separador
+    if command -v nslookup &>/dev/null; then
+        nslookup "$dominio" 127.0.0.1 2>&1 | sed 's/^/  /'
+    else
+        msg_warn "nslookup no disponible. Instala bind-utils."
+    fi
+
+    # ── 4. nslookup www ──
+    echo -e "\n${YELLOW}  [4/6] nslookup www.$dominio @127.0.0.1${NC}"
+    separador
+    command -v nslookup &>/dev/null && nslookup "www.$dominio" 127.0.0.1 2>&1 | sed 's/^/  /'
+
+    # ── 5. dig resolución A ──
+    echo -e "\n${YELLOW}  [5/6] dig $dominio A — Resolución directa${NC}"
+    separador
+    if command -v dig &>/dev/null; then
+        dig @127.0.0.1 "$dominio" A 2>&1 | sed 's/^/  /'
+    else
+        msg_warn "dig no disponible."
+    fi
+
+    # ── 6. Ping al www ──
+    echo -e "\n${YELLOW}  [6/6] ping -c3 www.$dominio — Prueba de conectividad${NC}"
+    separador
+    # Temporalmente usar nuestro DNS
+    local dns_orig
+    dns_orig=$(grep '^nameserver' /etc/resolv.conf | head -1 | awk '{print $2}')
+    ping -c 3 -W 2 "www.$dominio" 2>&1 | sed 's/^/  /' || true
+
+    echo ""
+    separador
+    echo -e "  ${DIM}Nota: Para pruebas desde cliente externo, configura el"
+    echo -e "  DNS del cliente a ${BOLD}$(obtener_ip_actual)${NC}${DIM} e intenta:${NC}"
+    echo -e "  ${BOLD}  nslookup $dominio $(obtener_ip_actual)${NC}"
+    separador
+
+    log "Pruebas ejecutadas para: $dominio"
+    pausar
+}
+
+# =============================================================================
+#  MÓDULO 8 ── GESTIÓN DEL SERVICIO
+# =============================================================================
+
+_recargar_bind() {
+    if rndc reload &>/dev/null; then
+        msg_ok "Zonas recargadas con rndc reload."
+    elif systemctl reload "$DNS_SERVICE" &>/dev/null; then
+        msg_ok "Servicio recargado (systemctl reload)."
+    else
+        systemctl restart "$DNS_SERVICE" &>/dev/null
+        sleep 2
+        systemctl is-active "$DNS_SERVICE" &>/dev/null \
+            && msg_ok "Servicio reiniciado." \
+            || msg_err "Error al reiniciar el servicio."
     fi
 }
 
-# --------------------------------------------------------------------------
-# Probar resolucion
-# --------------------------------------------------------------------------
+modulo_servicio() {
+    titulo "Estado y Gestión del Servicio DNS"
 
-probar_resolucion() {
-    echo ""
-
-    if ! grep -q 'zone "' "$ZONES_CONF" 2>/dev/null; then
-        echo "No hay zonas configuradas."
-        return
-    fi
-
-    echo "Zonas disponibles:"
-    grep 'zone "' "$ZONES_CONF" | sed 's/.*zone "\(.*\)".*/  \1/'
-    echo ""
-
-    read -rp "Dominio a probar: " entrada
-    local DOMAIN
-    DOMAIN=$(normalizar_dominio "$entrada")
-    [[ -z "$DOMAIN" ]] && echo "Dominio vacio." && return
-
-    local ZONE_FILE="$ZONE_DIR/db.$DOMAIN"
+    echo -e "${CYAN}${BOLD}  Estado actual:${NC}"
+    systemctl status "$DNS_SERVICE" --no-pager -l | sed 's/^/  /'
 
     echo ""
-    echo "--- named-checkconf ---"
-    named-checkconf "$NAMED_CONF" 2>&1 && echo "Sin errores." || echo "ERROR de sintaxis."
+    separador
+    echo "  [1] Recargar zonas (rndc reload)     — sin downtime"
+    echo "  [2] Reiniciar servicio completo"
+    echo "  [3] Detener servicio"
+    echo "  [4] Ver log de named"
+    echo "  [5] Ver log del script"
+    echo "  [0] Volver al menú"
+    separador
+    read -rp "  Opción: " opc
 
-    echo ""
-    echo "--- named-checkzone $DOMAIN ---"
-    [[ -f "$ZONE_FILE" ]] \
-        && named-checkzone "$DOMAIN" "$ZONE_FILE" 2>&1 \
-        || echo "Archivo no encontrado: $ZONE_FILE"
-
-    echo ""
-    echo "--- nslookup $DOMAIN 127.0.0.1 ---"
-    command -v nslookup &>/dev/null && nslookup "$DOMAIN" 127.0.0.1 || echo "nslookup no disponible."
-
-    echo ""
-    echo "--- nslookup www.$DOMAIN 127.0.0.1 ---"
-    command -v nslookup &>/dev/null && nslookup "www.$DOMAIN" 127.0.0.1
-
-    echo ""
-    echo "--- dig @127.0.0.1 $DOMAIN A ---"
-    command -v dig &>/dev/null && dig @127.0.0.1 "$DOMAIN" A +short || echo "dig no disponible."
-
-    echo ""
-    echo "--- ping -c3 www.$DOMAIN ---"
-    ping -c 3 -W 2 "www.$DOMAIN" 2>&1 || true
-}
-
-# --------------------------------------------------------------------------
-# Borrar configuracion
-# --------------------------------------------------------------------------
-
-borrar_dns() {
-    echo ""
-    echo "Se eliminara:"
-    echo "  - Todas las zonas en $ZONES_CONF"
-    echo "  - Archivos db.* en $ZONE_DIR"
-    echo "  - Seriales en $SERIAL_DIR"
-    echo "  - El servicio named se detiene"
-    echo ""
-    read -rp "Confirma escribiendo BORRAR: " conf
-    [[ "$conf" != "BORRAR" ]] && echo "Cancelado." && return
-
-    systemctl stop named 2>/dev/null
-    [[ -f "$ZONES_CONF" ]] && > "$ZONES_CONF" && echo "zonas.conf vaciado."
-    local old="/etc/named.d/zonas_locales.conf"
-    [[ -f "$old" ]] && > "$old"
-    local count
-    count=$(find "$ZONE_DIR" -maxdepth 1 -name 'db.*' 2>/dev/null | wc -l)
-    [[ "$count" -gt 0 ]] && rm -f "$ZONE_DIR"/db.* && echo "$count archivo(s) de zona eliminados."
-    [[ -d "$SERIAL_DIR" ]] && rm -f "$SERIAL_DIR"/* && echo "Seriales eliminados."
-    systemctl disable named &>/dev/null
-    echo "Configuracion DNS eliminada."
-    echo "Para reiniciar usa la opcion 1."
-}
-
-# --------------------------------------------------------------------------
-# Resolver conflictos de zonas duplicadas al arrancar
-# --------------------------------------------------------------------------
-
-_resolver_conflictos() {
-    local old="/etc/named.d/zonas_locales.conf"
-    [[ -f "$old" ]] && grep -q 'zone "' "$old" 2>/dev/null || return
-    [[ -f "$ZONES_CONF" ]] || return
-
-    while IFS= read -r dom; do
-        [[ -z "$dom" ]] && continue
-        grep -q "\"$dom\"" "$ZONES_CONF" 2>/dev/null || continue
-        local ln total inicio fin prev
-        ln=$(grep -n "\"$dom\"" "$old" | head -1 | cut -d: -f1)
-        [[ -z "$ln" ]] && continue
-        total=$(wc -l < "$old")
-        inicio="$ln"
-        [[ "$ln" -gt 1 ]] && {
-            prev=$(sed -n "$(( ln - 1 ))p" "$old")
-            echo "$prev" | grep -q '^//' && inicio=$(( ln - 1 ))
-        }
-        fin="$ln"
-        while [[ "$fin" -le "$total" ]]; do
-            sed -n "${fin}p" "$old" | grep -qE '^\s*\};\s*$' && break
-            fin=$(( fin + 1 ))
-        done
-        sed -i "${inicio},${fin}d" "$old"
-    done < <(grep 'zone "' "$old" | sed 's/.*zone "\(.*\)".*/\1/')
-}
-
-# --------------------------------------------------------------------------
-# Menu
-# --------------------------------------------------------------------------
-
-_resolver_conflictos
-
-while true; do
-    clear
-    echo "=============================="
-    echo " DNS openSUSE Leap - BIND9"
-    echo " IP: $(get_ip)"
-    echo "=============================="
-    echo "1) Instalar DNS"
-    echo "2) Configurar IP estatica"
-    echo "3) Crear zona DNS"
-    echo "4) Alta de registro DNS"
-    echo "5) Baja de registro DNS"
-    echo "6) Consultar zona"
-    echo "7) Probar resolucion"
-    echo "8) Eliminar zona DNS"
-    echo "9) Borrar configuracion DNS"
-    echo "0) Salir"
-    echo ""
-    read -rp "Opcion: " op
-
-    case $op in
-        1) instalar_dns ;;
-        2) configurar_ip ;;
-        3) crear_zona ;;
-        4) alta_registro ;;
-        5) baja_registro ;;
-        6) consultar_zona ;;
-        7) probar_resolucion ;;
-        8) baja_zona ;;
-        9) borrar_dns ;;
-        0) exit 0 ;;
-        *) echo "Opcion invalida." ;;
+    case "$opc" in
+        1) _recargar_bind ;;
+        2) systemctl restart "$DNS_SERVICE"; sleep 2
+           systemctl is-active "$DNS_SERVICE" &>/dev/null \
+               && msg_ok "Reiniciado." || msg_err "Error al reiniciar."
+           ;;
+        3) systemctl stop "$DNS_SERVICE" && msg_ok "Servicio detenido." ;;
+        4) echo -e "\n${CYAN}Últimas 30 líneas del log de named:${NC}"
+           [[ -f /var/log/named.log ]] \
+               && tail -30 /var/log/named.log | sed 's/^/  /' \
+               || journalctl -u named -n 30 --no-pager | sed 's/^/  /'
+           ;;
+        5) echo -e "\n${CYAN}Últimas 30 líneas del log del script:${NC}"
+           [[ -f "$LOG_FILE" ]] && tail -30 "$LOG_FILE" | sed 's/^/  /' || msg_warn "Sin log todavía."
+           ;;
+        0) return ;;
+        *) msg_warn "Opción inválida." ;;
     esac
+    pausar
+}
 
-    pause
-done
+# =============================================================================
+#  INICIALIZACIÓN
+# =============================================================================
 
+_inicializar() {
+    mkdir -p "$(dirname "$LOG_FILE")" "$NAMED_D" "$ZONES_DIR" 2>/dev/null
+    touch "$LOG_FILE" 2>/dev/null || true
+    [[ ! -f "$ZONES_FILE" ]] && touch "$ZONES_FILE" 2>/dev/null || true
+
+    # Detectar IP del servidor silenciosamente
+    DNS_SERVER_IP=$(obtener_ip_actual)
+}
+
+# =============================================================================
+#  MENÚ PRINCIPAL
+# =============================================================================
+
+menu_principal() {
+    while true; do
+        clear
+        local ip_display="${DNS_SERVER_IP:-'No detectada'}"
+        local svc_estado
+        systemctl is-active "$DNS_SERVICE" &>/dev/null \
+            && svc_estado="${GREEN}●  Activo${NC}" \
+            || svc_estado="${RED}●  Inactivo${NC}"
+
+        echo -e "${BOLD}${BLUE}"
+        echo "  ╔════════════════════════════════════════════════════╗"
+        echo "  ║      GESTOR DNS · BIND9 · OpenSUSE Leap            ║"
+        echo "  ╠════════════════════════════════════════════════════╣"
+        printf "  ║  Interfaz : %-38s║\n" "$IFACE"
+        printf "  ║  IP DNS   : %-38s║\n" "$ip_display"
+        echo -e "  ║  Servicio : $(echo -e $svc_estado)$(printf '%42s' '')${BOLD}${BLUE}║"
+        echo "  ╚════════════════════════════════════════════════════╝"
+        echo -e "${NC}"
+
+        echo -e "  ${BOLD}CONFIGURACIÓN INICIAL${NC}"
+        echo    "  [1]  Instalar BIND9                (idempotente)"
+        echo    "  [2]  Verificar / Configurar IP estática"
+        echo ""
+        echo -e "  ${BOLD}GESTIÓN DE ZONAS DNS${NC}"
+        echo    "  [3]  Alta de dominio/zona"
+        echo    "  [4]  Baja de dominio/zona"
+        echo    "  [5]  Consultar zonas configuradas"
+        echo ""
+        echo -e "  ${BOLD}DIAGNÓSTICO Y SERVICIO${NC}"
+        echo    "  [6]  Probar resolución DNS"
+        echo    "  [7]  Estado y gestión del servicio"
+        echo ""
+        echo    "  [0]  Salir"
+        echo ""
+        read -rp "  Selecciona una opción: " opcion
+
+        case "$opcion" in
+            1) modulo_instalar ;;
+            2) modulo_ip_fija ;;
+            3) modulo_alta ;;
+            4) modulo_baja ;;
+            5) modulo_consultar ;;
+            6) modulo_probar ;;
+            7) modulo_servicio ;;
+            0)
+                echo -e "\n${CYAN}  Saliendo del Gestor DNS. ¡Hasta pronto!${NC}\n"
+                exit 0
+                ;;
+            *)
+                msg_warn "Opción inválida."
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# =============================================================================
+#  SOPORTE CLI — parámetros para reutilización futura
+# =============================================================================
+
+_uso() {
+    echo ""
+    echo "  Uso: $0 [--opcion] [argumentos]"
+    echo ""
+    echo "  Opciones:"
+    echo "    (sin argumento)       Menú interactivo completo"
+    echo "    --instalar            Instalar BIND9 de forma idempotente"
+    echo "    --ip                  Verificar / configurar IP estática"
+    echo "    --alta DOMINIO IP     Dar de alta una zona DNS"
+    echo "    --baja DOMINIO        Dar de baja una zona DNS"
+    echo "    --consultar           Listar zonas configuradas"
+    echo "    --probar DOMINIO      Ejecutar pruebas de resolución"
+    echo "    --estado              Ver estado del servicio named"
+    echo "    --ayuda               Mostrar este mensaje"
+    echo ""
+}
+
+# =============================================================================
+#  PUNTO DE ENTRADA
+# =============================================================================
+verificar_root
+_inicializar
+
+case "${1:-}" in
+    --instalar)  modulo_instalar ;;
+    --ip)        modulo_ip_fija ;;
+    --alta)
+        [[ -z "${2:-}" || -z "${3:-}" ]] && { msg_err "Uso: $0 --alta dominio ip"; exit 1; }
+        entrada="$2"; ip_param="$3"
+        dominio=$(_normalizar_dominio "$entrada")
+        _validar_dominio "$dominio" || { msg_err "Dominio inválido."; exit 1; }
+        _validar_ip "$ip_param"     || { msg_err "IP inválida."; exit 1; }
+        DNS_SERVER_IP=$(obtener_ip_actual)
+        # Llamada directa sin interacción
+        [[ ! -f "$ZONES_FILE" ]] && touch "$ZONES_FILE"
+        archivo_z=$(_archivo_zona "$dominio")
+        serial=$(date +%Y%m%d%02d)
+        cat > "$archivo_z" <<EOF
+\$TTL 86400
+@ IN SOA ns1.${dominio}. admin.${dominio}. (${serial} 3600 1800 604800 86400)
+@ IN NS  ns1.${dominio}.
+ns1 IN A   ${DNS_SERVER_IP}
+@   IN A   ${ip_param}
+www IN CNAME ${dominio}.
+EOF
+        cat >> "$ZONES_FILE" <<EOF
+zone "$dominio" IN { type master; file "$archivo_z"; allow-update { none; }; };
+EOF
+        named-checkconf && _recargar_bind && msg_ok "Zona '$dominio' creada."
+        ;;
+    --baja)
+        [[ -z "${2:-}" ]] && { msg_err "Uso: $0 --baja dominio"; exit 1; }
+        dominio=$(_normalizar_dominio "$2")
+        _eliminar_zona_conf "$dominio"
+        _recargar_bind && msg_ok "Zona '$dominio' eliminada."
+        ;;
+    --consultar) modulo_consultar ;;
+    --probar)
+        [[ -z "${2:-}" ]] && { msg_err "Uso: $0 --probar dominio"; exit 1; }
+        entrada="$2"; dominio=$(_normalizar_dominio "$entrada")
+        modulo_probar <<< "$dominio"
+        ;;
+    --estado)    modulo_servicio ;;
+    --ayuda|-h)  _uso ;;
+    "")          menu_principal ;;
+    *)           msg_err "Opción desconocida: $1"; _uso; exit 1 ;;
+esac
