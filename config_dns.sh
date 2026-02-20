@@ -1,13 +1,7 @@
 #!/bin/bash
 
-# ===============================
-# VALIDAR ROOT
-# ===============================
 [[ $EUID -ne 0 ]] && echo "Ejecuta como root" && exit 1
 
-# ===============================
-# VARIABLES
-# ===============================
 INTERFACE="enp0s8"
 NAMED_CONF="/etc/named.conf"
 ZONES_CONF="/etc/named.d/zonas.conf"
@@ -16,20 +10,13 @@ SERIAL_DIR="/var/lib/named/serial"
 
 pause() { read -p "ENTER para continuar..."; }
 
-# ===============================
-# OBTENER IP
-# ===============================
 get_ip() {
     ip -4 addr show "$INTERFACE" | awk '/inet / {print $2}' | cut -d/ -f1
 }
 
-# ===============================
-# VALIDAR IP ESTÁTICA
-# ===============================
 validar_ip() {
     IP=$(get_ip)
     if [[ -z "$IP" ]]; then
-        echo "La interfaz $INTERFACE no tiene IP fija"
         read -p "IP estática: " IP
         read -p "Prefijo (ej. 24): " MASK
         ip addr add "$IP/$MASK" dev "$INTERFACE"
@@ -37,9 +24,6 @@ validar_ip() {
     fi
 }
 
-# ===============================
-# SERIAL
-# ===============================
 next_serial() {
     local domain="$1"
     local file="$SERIAL_DIR/$domain.serial"
@@ -51,13 +35,9 @@ next_serial() {
     else
         echo $(( $(cat "$file") + 1 )) > "$file"
     fi
-
     cat "$file"
 }
 
-# ===============================
-# INSTALAR DNS (IDEMPOTENTE)
-# ===============================
 instalar_dns() {
     rpm -q bind &>/dev/null && echo "BIND ya instalado" && return
 
@@ -80,22 +60,12 @@ EOF
     systemctl enable named
     systemctl restart named
 
-    cat > /etc/resolv.conf <<EOF
-nameserver 127.0.0.1
-EOF
-
-    echo "DNS instalado y configurado"
+    echo "DNS instalado"
 }
 
-# ===============================
-# CREAR ZONA
-# ===============================
 crear_zona() {
     validar_ip
-
     read -p "Dominio (ej. ejemplo.com): " DOMAIN
-    [[ -z "$DOMAIN" ]] && echo "Dominio inválido" && return
-
     ZONE_FILE="$ZONE_DIR/db.$DOMAIN"
 
     grep -q "zone \"$DOMAIN\"" "$ZONES_CONF" && echo "Zona ya existe" && return
@@ -126,36 +96,69 @@ www IN CNAME @
 EOF
 
     chown named:named "$ZONE_FILE"
-
     named-checkconf && named-checkzone "$DOMAIN" "$ZONE_FILE" && systemctl restart named
 
-    echo "Zona $DOMAIN creada correctamente"
+    echo "Zona creada"
 }
 
-# ===============================
-# BAJA ZONA
-# ===============================
+alta_registro() {
+    read -p "Zona (ej. ejemplo.com): " DOMAIN
+    ZONE_FILE="$ZONE_DIR/db.$DOMAIN"
+    [[ ! -f "$ZONE_FILE" ]] && echo "Zona no existe" && return
+
+    read -p "Nombre (ej. host o ejemplo.com): " NAME
+    read -p "IP destino: " IP
+
+    if [[ "$NAME" == "$DOMAIN" ]]; then
+        HOST="@"
+    else
+        HOST="$NAME"
+    fi
+
+    grep -q "^$HOST " "$ZONE_FILE" && echo "Registro ya existe" && return
+
+    echo "$HOST IN A $IP" >> "$ZONE_FILE"
+
+    if [[ "$HOST" == "@" ]]; then
+        echo "www IN CNAME @" >> "$ZONE_FILE"
+    fi
+
+    next_serial "$DOMAIN" > /dev/null
+    named-checkzone "$DOMAIN" "$ZONE_FILE" && systemctl restart named
+
+    echo "Registro agregado"
+}
+
+baja_registro() {
+    read -p "Zona: " DOMAIN
+    read -p "Registro a eliminar (ej. host o @): " HOST
+
+    ZONE_FILE="$ZONE_DIR/db.$DOMAIN"
+    [[ ! -f "$ZONE_FILE" ]] && echo "Zona no existe" && return
+
+    sed -i "/^$HOST /d" "$ZONE_FILE"
+
+    [[ "$HOST" == "@" ]] && sed -i "/^www /d" "$ZONE_FILE"
+
+    next_serial "$DOMAIN" > /dev/null
+    named-checkzone "$DOMAIN" "$ZONE_FILE" && systemctl restart named
+
+    echo "Registro eliminado"
+}
+
 baja_zona() {
     read -p "Dominio a eliminar: " DOMAIN
-    ZONE_FILE="$ZONE_DIR/db.$DOMAIN"
-
     sed -i "/zone \"$DOMAIN\"/,+3d" "$ZONES_CONF"
-    rm -f "$ZONE_FILE" "$SERIAL_DIR/$DOMAIN.serial"
-
+    rm -f "$ZONE_DIR/db.$DOMAIN" "$SERIAL_DIR/$DOMAIN.serial"
     systemctl restart named
     echo "Zona eliminada"
 }
 
-# ===============================
-# CONSULTAR ZONAS
-# ===============================
-consultar_zonas() {
-    cat "$ZONES_CONF"
+consultar_zona() {
+    read -p "Dominio: " DOMAIN
+    cat "$ZONE_DIR/db.$DOMAIN"
 }
 
-# ===============================
-# BORRAR CONFIGURACIÓN DNS
-# ===============================
 borrar_dns() {
     systemctl stop named
     rm -f "$ZONE_DIR"/db.*
@@ -165,27 +168,29 @@ borrar_dns() {
     echo "Configuración DNS eliminada"
 }
 
-# ===============================
-# MENÚ
-# ===============================
 while true; do
     clear
+    echo "=============================="
     echo " DNS openSUSE Leap - BIND9"
-    echo " Interfaz: $INTERFACE"
+    echo "=============================="
     echo "1) Instalar DNS"
     echo "2) Crear zona DNS"
-    echo "3) Eliminar zona DNS"
-    echo "4) Consultar zonas"
-    echo "5) Borrar configuración DNS"
+    echo "3) Alta de registro DNS"
+    echo "4) Baja de registro DNS"
+    echo "5) Consultar zona"
+    echo "6) Eliminar zona DNS"
+    echo "7) Borrar configuración DNS"
     echo "0) Salir"
     read -p "Opción: " op
 
     case $op in
         1) instalar_dns ;;
         2) crear_zona ;;
-        3) baja_zona ;;
-        4) consultar_zonas ;;
-        5) borrar_dns ;;
+        3) alta_registro ;;
+        4) baja_registro ;;
+        5) consultar_zona ;;
+        6) baja_zona ;;
+        7) borrar_dns ;;
         0) exit ;;
         *) echo "Opción inválida" ;;
     esac
