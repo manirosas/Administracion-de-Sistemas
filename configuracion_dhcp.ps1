@@ -25,6 +25,13 @@ function IP-a-Int {
     return [BitConverter]::ToUInt32($bytes, 0)
 }
 
+function Int-a-IP {
+    param ([uint32]$int)
+    $bytes = [BitConverter]::GetBytes($int)
+    [Array]::Reverse($bytes)
+    return ([System.Net.IPAddress]::new($bytes)).ToString()
+}
+
 # Obtener máscara automática
 function Mascara-Automatica {
     param ([string]$ip)
@@ -64,47 +71,78 @@ function Instalar-DHCP {
 function Configurar-DHCP {
 
     do {
-        $ipInicio = Read-Host "IP inicial del rango"
-    } until (Validar-IP $ipInicio -and ($ipInicio.Split(".")[3] -ne "255"))
+        $ipServidor = Read-Host "IP inicial (se asignará al servidor)"
+    } until (Validar-IP $ipServidor -and ($ipServidor.Split(".")[3] -ne "255"))
 
     do {
-        $ipFinal = Read-Host "IP final del rango"
+        $ipFinal = Read-Host "IP final del rango DHCP"
     } until (Validar-IP $ipFinal -and ($ipFinal.Split(".")[3] -ne "255"))
 
-    if ((IP-a-Int $ipFinal) -le (IP-a-Int $ipInicio)) {
-        Write-Host "ERROR: La IP final debe ser mayor a la inicial."
+    if ((IP-a-Int $ipFinal) -le (IP-a-Int $ipServidor)) {
+        Write-Host "ERROR: La IP final debe ser mayor a la IP del servidor."
         return
     }
 
+    # IP inicial DHCP = IP servidor + 1
+    $ipInicioDHCP = Int-a-IP ((IP-a-Int $ipServidor) + 1)
+
+    # Máscara
     $mascara = Read-Host "Máscara de red (ENTER para automática)"
     if ([string]::IsNullOrWhiteSpace($mascara)) {
-        $mascara = Mascara-Automatica $ipInicio
+        $mascara = Mascara-Automatica $ipServidor
         Write-Host "Máscara automática asignada: $mascara"
     }
 
+    # Asignar IP al servidor
+    Write-Host "Asignando IP $ipServidor a la interfaz enps08..."
+    New-NetIPAddress `
+        -InterfaceAlias "enps08" `
+        -IPAddress $ipServidor `
+        -PrefixLength 24 `
+        -ErrorAction SilentlyContinue
+
+    # Lease
     $leaseHoras = Read-Host "Tiempo de concesión en horas"
     $lease = New-TimeSpan -Hours $leaseHoras
 
+    # Gateway
     $gateway = Read-Host "Gateway (ENTER para automático)"
     if ([string]::IsNullOrWhiteSpace($gateway)) {
-        $gateway = Gateway-Automatico $ipInicio
+        $gateway = Gateway-Automatico $ipServidor
         Write-Host "Gateway automático: $gateway"
     }
 
-    $scopeName = "Scope_$($ipInicio)_$($ipFinal)"
+    # DNS
+    do {
+        $dns1 = Read-Host "DNS primario (ENTER para 8.8.8.8)"
+        if ([string]::IsNullOrWhiteSpace($dns1)) { $dns1 = "8.8.8.8" }
+    } until (Validar-IP $dns1)
+
+    do {
+        $dns2 = Read-Host "DNS secundario (ENTER para 4.4.4.4)"
+        if ([string]::IsNullOrWhiteSpace($dns2)) { $dns2 = "4.4.4.4" }
+    } until (Validar-IP $dns2)
+
+    $scopeName = "Scope_$ipInicioDHCP`_$ipFinal"
 
     Add-DhcpServerv4Scope `
         -Name $scopeName `
-        -StartRange $ipInicio `
+        -StartRange $ipInicioDHCP `
         -EndRange $ipFinal `
         -SubnetMask $mascara `
         -LeaseDuration $lease
 
     Set-DhcpServerv4OptionValue `
-        -ScopeId $ipInicio `
-        -Router $gateway
+        -ScopeId $ipServidor `
+        -Router $gateway `
+        -DnsServer $dns1, $dns2
 
-    Write-Host "Scope DHCP configurado correctamente."
+    Write-Host ""
+    Write-Host "DHCP configurado correctamente"
+    Write-Host "Servidor: $ipServidor"
+    Write-Host "Rango DHCP: $ipInicioDHCP - $ipFinal"
+    Write-Host "Gateway: $gateway"
+    Write-Host "DNS: $dns1 , $dns2"
 }
 
 # VER LEASES
