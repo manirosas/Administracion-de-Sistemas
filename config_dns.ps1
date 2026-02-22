@@ -1,157 +1,105 @@
 # SCRIPT DNS - Windows Server 2022
+# Administración de Zonas y Registros (A, CNAME)
 
 function Pausa {
     Write-Host ""
-    Read-Host "Presiona ENTER para continuar"
+    Read-Host "Presiona ENTER para continuar..."
 }
 
-# Validar IP
-function Validar-IP {
-    param ([string]$ip)
-    try {
-        [System.Net.IPAddress]::Parse($ip) | Out-Null
-        return $true
-    } catch {
-        return $false
-    }
-}
-
-# INSTALAR DNS (IDEMPOTENTE)
+# 1. INSTALACIÓN IDEMPOTENTE
 function Instalar-DNS {
     $rol = Get-WindowsFeature -Name DNS
     if ($rol.Installed) {
         Write-Host "El rol DNS ya está instalado."
-        return
-    }
-
-    $resp = Read-Host "¿Deseas instalar el rol DNS? (S/N)"
-    if ($resp -match "^[sS]") {
-        Install-WindowsFeature DNS -IncludeManagementTools
-        Write-Host "Rol DNS instalado correctamente."
     } else {
-        Write-Host "Instalación cancelada."
+        $resp = Read-Host "¿Deseas instalar el rol DNS? (S/N)"
+        if ($resp -match "^[sS]") {
+            Write-Host "Instalando DNS y herramientas de gestión..."
+            Install-WindowsFeature DNS -IncludeManagementTools
+            Write-Host "Instalación completada."
+        } else {
+            Write-Host "Operación cancelada."
+        }
     }
 }
 
-# ALTA DE ZONA DNS
-function Alta-ZonaDNS {
+# 2. ALTA DE REGISTROS (ZONA -> DOMINIO -> REGISTROS)
+function Alta-RegistrosDNS {
+    $zona = Read-Host "Ingresa el nombre de la zona (ej. reprobados.com)"
+    
+    # Crear zona si no existe
+    if (!(Get-DnsServerZone -Name $zona -ErrorAction SilentlyContinue)) {
+        Write-Host "La zona no existe. Creándola..."
+        # Intento de creación para entornos con o sin Active Directory
+        try {
+            Add-DnsServerPrimaryZone -Name $zona -ReplicationScope "Forest" -ErrorAction Stop
+        } catch {
+            Add-DnsServerPrimaryZone -Name $zona -ZoneFile "$zona.dns" -ErrorAction SilentlyContinue
+        }
+    }
 
-    $zona = Read-Host "Nombre de la zona (ej. ejemplo.local)"
+    # Registro Tipo A
+    $ipA = Read-Host "Ingresa la IP para el registro Tipo A de $zona"
+    Add-DnsServerResourceRecordA -ZoneName $zona -Name "@" -IPv4Address $ipA -AllowUpdateAny
+    Write-Host "Registro A (@ -> $ipA) creado."
 
+    # Registro WWW (A o CNAME)
+    $tipoWWW = Read-Host "¿Deseas crear 'www' como (A) o (CNAME)?"
+    if ($tipoWWW.ToUpper() -eq "A") {
+        $ipWWW = Read-Host "Ingresa la IP para www.$zona"
+        Add-DnsServerResourceRecordA -ZoneName $zona -Name "www" -IPv4Address $ipWWW
+    } else {
+        Add-DnsServerResourceRecordCName -ZoneName $zona -Name "www" -HostNameAlias "$zona."
+    }
+    Write-Host "Registro www creado correctamente."
+}
+
+# 3. DAR DE BAJA ZONAS
+function Baja-ZonaDNS {
+    $zona = Read-Host "Ingresa el nombre de la zona a ELIMINAR"
     if (Get-DnsServerZone -Name $zona -ErrorAction SilentlyContinue) {
-        Write-Host "La zona ya existe."
-        return
-    }
-
-    Add-DnsServerPrimaryZone `
-        -Name $zona `
-        -ZoneFile "$zona.dns"
-
-    Write-Host "Zona DNS creada correctamente."
-}
-
-# ALTA DE REGISTRO DNS
-function Alta-RegistroDNS {
-
-    $zona = Read-Host "Zona DNS"
-    if (-not (Get-DnsServerZone -Name $zona -ErrorAction SilentlyContinue)) {
+        $confirm = Read-Host "¿Estás seguro de eliminar la zona $zona y TODOS sus registros? (S/N)"
+        if ($confirm -match "^[sS]") {
+            Remove-DnsServerZone -Name $zona -Force
+            Write-Host "Zona $zona eliminada."
+        }
+    } else {
         Write-Host "La zona no existe."
-        return
-    }
-
-    Write-Host "1. Registro A"
-    Write-Host "2. Registro CNAME"
-    $tipo = Read-Host "Selecciona el tipo de registro"
-
-    switch ($tipo) {
-
-        "1" {
-            $nombre = Read-Host "Nombre del host (ej. www)"
-            do {
-                $ip = Read-Host "IP del host"
-            } until (Validar-IP $ip)
-
-            Add-DnsServerResourceRecordA `
-                -ZoneName $zona `
-                -Name $nombre `
-                -IPv4Address $ip
-
-            Write-Host "Registro A creado correctamente."
-        }
-
-        "2" {
-            $alias = Read-Host "Nombre del alias"
-            $destino = Read-Host "Nombre destino (FQDN)"
-
-            Add-DnsServerResourceRecordCName `
-                -ZoneName $zona `
-                -Name $alias `
-                -HostNameAlias $destino
-
-            Write-Host "Registro CNAME creado correctamente."
-        }
-
-        default {
-            Write-Host "Opción inválida."
-        }
     }
 }
-# BAJA DE REGISTRO DNS
-function Baja-RegistroDNS {
 
-    $zona = Read-Host "Zona DNS"
-    if (-not (Get-DnsServerZone -Name $zona -ErrorAction SilentlyContinue)) {
-        Write-Host "La zona no existe."
-        return
+# 4. CONSULTAR ZONAS Y DOMINIOS
+function Consultar-DNS {
+    Write-Host "--- ZONAS ACTUALES ---"
+    Get-DnsServerZone | Select-Object ZoneName, ZoneType, IsReadOnly | Format-Table -AutoSize
+    
+    $zona = Read-Host "Ingresa nombre de zona para ver sus registros (ENTER para saltar)"
+    if (![string]::IsNullOrWhiteSpace($zona)) {
+        Get-DnsServerResourceRecord -ZoneName $zona | Select-Object HostName, RecordType, RecordData | Format-Table -AutoSize
     }
-
-    $nombre = Read-Host "Nombre del registro a eliminar"
-
-    $registros = Get-DnsServerResourceRecord -ZoneName $zona -Name $nombre -ErrorAction SilentlyContinue
-    if (-not $registros) {
-        Write-Host "El registro no existe."
-        return
-    }
-
-    foreach ($r in $registros) {
-        Remove-DnsServerResourceRecord `
-            -ZoneName $zona `
-            -InputObject $r `
-            -Force
-    }
-
-    Write-Host "Registro eliminado correctamente."
-}
-
-# CONSULTAR ZONAS DNS
-function Consultar-ZonasDNS {
-    Get-DnsServerZone | Format-Table ZoneName, ZoneType, IsAutoCreated
 }
 
 # MENÚ PRINCIPAL
 do {
     Clear-Host
-    Write-Host "==============================="
-    Write-Host "   ADMINISTRACIÓN DNS"
-    Write-Host "==============================="
-    Write-Host "1. Instalar rol DNS"
-    Write-Host "2. Dar de alta zona DNS"
-    Write-Host "3. Dar de alta registro DNS"
-    Write-Host "4. Dar de baja registro DNS"
-    Write-Host "5. Consultar zonas DNS"
-    Write-Host "6. Salir"
-    Write-Host "==============================="
-
+    Write-Host "======================================"
+    Write-Host "      ADMINISTRACIÓN DNS SERVER"
+    Write-Host "======================================"
+    Write-Host "1. Instalar rol DNS (Idempotente)"
+    Write-Host "2. Alta de Zona y Registros (A/CNAME)"
+    Write-Host "3. Dar de baja una Zona"
+    Write-Host "4. Consultar Zonas y Registros"
+    Write-Host "5. Salir"
+    Write-Host "======================================"
+    
     $opcion = Read-Host "Selecciona una opción"
 
     switch ($opcion) {
         "1" { Instalar-DNS; Pausa }
-        "2" { Alta-ZonaDNS; Pausa }
-        "3" { Alta-RegistroDNS; Pausa }
-        "4" { Baja-RegistroDNS; Pausa }
-        "5" { Consultar-ZonasDNS; Pausa }
-        "6" { Write-Host "Saliendo..." }
+        "2" { Alta-RegistrosDNS; Pausa }
+        "3" { Baja-ZonaDNS; Pausa }
+        "4" { Consultar-DNS; Pausa }
+        "5" { Write-Host "Saliendo..." }
         default { Write-Host "Opción inválida"; Pausa }
     }
-
-} until ($opcion -eq "6")
+} until ($opcion -eq "5")
