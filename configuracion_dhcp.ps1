@@ -26,30 +26,14 @@ function IP-a-Int {
     param([string]$ip)
     $bytes = ([System.Net.IPAddress]::Parse($ip)).GetAddressBytes()
     [Array]::Reverse($bytes)
-    return [BitConverter]::ToUInt32($bytes,0)
+    [BitConverter]::ToUInt32($bytes,0)
 }
 
 function Int-a-IP {
     param([uint32]$int)
     $bytes = [BitConverter]::GetBytes($int)
     [Array]::Reverse($bytes)
-    return ([System.Net.IPAddress]::new($bytes)).ToString()
-}
-
-# -------------------------------
-function Mascara-Automatica {
-    param([string]$ip)
-    $octeto = [int]($ip.Split(".")[0])
-    if ($octeto -le 126) { "255.0.0.0" }
-    elseif ($octeto -le 191) { "255.255.0.0" }
-    else { "255.255.255.0" }
-}
-
-# -------------------------------
-function Gateway-Automatico {
-    param([string]$ip)
-    $p = $ip.Split(".")
-    "$($p[0]).$($p[1]).$($p[2]).1"
+    ([System.Net.IPAddress]::new($bytes)).ToString()
 }
 
 # -------------------------------
@@ -70,44 +54,46 @@ function Instalar-DHCP {
 # -------------------------------
 function Configurar-DHCP {
 
-    # IP del servidor
+    # ---------------------------
+    # IP inicial
     do {
-        $ipServidor = Read-Host "IP inicial (se asignará al servidor)"
-    } until (
-        Validar-IP $ipServidor -and
-        ($ipServidor.Split(".")[3] -ne "255")
-    )
+        $ipInput = Read-Host "IP inicial (red .0, gateway .1 o servidor)"
+    } until (Validar-IP $ipInput)
 
+    $octetos = $ipInput.Split(".")
+    $base = "$($octetos[0]).$($octetos[1]).$($octetos[2])"
+    $ultimo = [int]$octetos[3]
+
+    # Gateway fijo
+    $gateway = "$base.1"
+
+    # Lógica IP servidor y DHCP
+    if ($ultimo -eq 0 -or $ultimo -eq 1) {
+        $ipServidor = "$base.2"
+        $ipInicioDHCP = "$base.3"
+    }
+    else {
+        $ipServidor = $ipInput
+        $ipInicioDHCP = Int-a-IP ((IP-a-Int $ipServidor) + 1)
+    }
+
+    # ---------------------------
     # IP final
     do {
         $ipFinal = Read-Host "IP final del rango DHCP"
-    } until (
-        Validar-IP $ipFinal -and
-        ($ipFinal.Split(".")[3] -ne "255")
-    )
+    } until (Validar-IP $ipFinal)
 
-    if ((IP-a-Int $ipFinal) -le (IP-a-Int $ipServidor)) {
-        Write-Host "ERROR: la IP final debe ser mayor que la inicial"
+    if ((IP-a-Int $ipFinal) -le (IP-a-Int $ipInicioDHCP)) {
+        Write-Host "ERROR: la IP final debe ser mayor que la inicial DHCP"
         return
     }
 
-    # DHCP inicia desde IP + 1
-    $ipInicioDHCP = Int-a-IP ((IP-a-Int $ipServidor) + 1)
+    # ---------------------------
+    # Máscara fija para laboratorio
+    $mascara = "255.255.255.0"
+    $prefix = 24
 
-    # Máscara
-    $mascara = Read-Host "Máscara (ENTER para automática)"
-    if ([string]::IsNullOrWhiteSpace($mascara)) {
-        $mascara = Mascara-Automatica $ipServidor
-        Write-Host "Máscara asignada automáticamente: $mascara"
-    }
-
-    # Gateway
-    $gateway = Read-Host "Gateway (ENTER para automático)"
-    if ([string]::IsNullOrWhiteSpace($gateway)) {
-        $gateway = Gateway-Automatico $ipServidor
-        Write-Host "Gateway automático: $gateway"
-    }
-
+    # ---------------------------
     # DNS
     do {
         $dns1 = Read-Host "DNS primario (OBLIGATORIO)"
@@ -118,7 +104,7 @@ function Configurar-DHCP {
         $dns2 = $null
     }
 
-    # -----------------------------
+    # ---------------------------
     # LIMPIAR IPs EXISTENTES
     Get-NetIPAddress -InterfaceAlias $Interfaz -AddressFamily IPv4 |
     Where-Object {
@@ -132,26 +118,29 @@ function Configurar-DHCP {
             -ErrorAction SilentlyContinue
     }
 
+    # ---------------------------
     # Asignar IP al servidor
     New-NetIPAddress `
         -InterfaceAlias $Interfaz `
         -IPAddress $ipServidor `
-        -PrefixLength 24 `
+        -PrefixLength $prefix `
         -DefaultGateway $gateway `
         -ErrorAction SilentlyContinue
 
-    # Forzar DNS en el servidor
+    # Forzar DNS (aunque no exista aún)
     Set-DnsClientServerAddress `
         -InterfaceAlias $Interfaz `
         -ServerAddresses $dns1 `
         -ErrorAction SilentlyContinue
 
+    # ---------------------------
     # Lease
     $leaseHoras = Read-Host "Tiempo de concesión (horas)"
     $lease = New-TimeSpan -Hours $leaseHoras
 
-    # Scope
-    $scopeId = "$($ipServidor.Split('.')[0]).$($ipServidor.Split('.')[1]).$($ipServidor.Split('.')[2]).0"
+    # ---------------------------
+    # Scope DHCP
+    $scopeId = "$base.0"
     $scopeName = "Scope_$scopeId"
 
     Add-DhcpServerv4Scope `
@@ -161,7 +150,6 @@ function Configurar-DHCP {
         -SubnetMask $mascara `
         -LeaseDuration $lease
 
-    # Opciones DHCP
     Set-DhcpServerv4OptionValue `
         -ScopeId $scopeId `
         -Router $gateway `
