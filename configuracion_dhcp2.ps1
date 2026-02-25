@@ -22,6 +22,16 @@ function Get-AutoMask {
     else { return '255.255.255.0' }
 }
 
+function Get-MaskPrefix {
+    param([string]$mask)
+    $bits = 0
+    foreach ($o in $mask.Split('.')) {
+        $b = [Convert]::ToString([int]$o, 2)
+        $bits += ($b.ToCharArray() | Where-Object { $_ -eq '1' }).Count
+    }
+    return $bits
+}
+
 function Get-AutoGateway {
     param([string]$ip)
     $parts = $ip.Split('.')
@@ -32,6 +42,17 @@ function IP-ToInt {
     param([string]$ip)
     $o = $ip.Split('.')
     return ([int]$o[0] * 16777216) + ([int]$o[1] * 65536) + ([int]$o[2] * 256) + [int]$o[3]
+}
+
+function Int-ToIP {
+    param([int64]$n)
+    $a = [math]::Floor($n / 16777216)
+    $rem = $n % 16777216
+    $b = [math]::Floor($rem / 65536)
+    $rem = $rem % 65536
+    $c = [math]::Floor($rem / 256)
+    $d = $rem % 256
+    return "$a.$b.$c.$d"
 }
 
 function Install-DHCP {
@@ -61,6 +82,13 @@ function Install-DHCP {
 }
 
 function Configure-DHCP {
+    # Verificar que la interfaz existe
+    $adapter = Get-NetAdapter -Name "Ethernet 2" -ErrorAction SilentlyContinue
+    if (-not $adapter) {
+        Write-Host "Error: No se encontro la interfaz 'Ethernet 2'."
+        return
+    }
+
     # IP inicial
     do {
         $ipStart = Read-Host "IP inicial del rango"
@@ -72,6 +100,7 @@ function Configure-DHCP {
         $ipEnd = Read-Host "IP final del rango"
         if (-not (Validate-IP $ipEnd)) {
             Write-Host "IP invalida."
+            $ipEnd = $null
             continue
         }
         if ((IP-ToInt $ipEnd) -le (IP-ToInt $ipStart)) {
@@ -102,52 +131,51 @@ function Configure-DHCP {
     } while (-not (Validate-IP $dns2))
 
     $mask    = Get-AutoMask -ip $ipStart
+    $prefix  = Get-MaskPrefix -mask $mask
     $gateway = Get-AutoGateway -ip $ipStart
+    $poolStart = Int-ToIP -n ((IP-ToInt $ipStart) + 1)
 
     Write-Host ""
     Write-Host "Mascara detectada : $mask"
     Write-Host "Gateway detectado : $gateway"
+    Write-Host "Rango DHCP        : $poolStart - $ipEnd"
     Write-Host ""
 
-    # La IP del servidor es ipStart, el rango DHCP empieza en ipStart+1
-    $startInt  = IP-ToInt $ipStart
-    $startInt1 = $startInt + 1
-    $b = [math]::Floor($startInt1 / 16777216)
-    $rem = $startInt1 % 16777216
-    $c = [math]::Floor($rem / 65536)
-    $rem = $rem % 65536
-    $d = [math]::Floor($rem / 256)
-    $e = $rem % 256
-    $poolStart = "$b.$c.$d.$e"
+    # Configurar IP en Ethernet 2
+    Write-Host "Configurando IP $ipStart en 'Ethernet 2'..."
 
-    $scopeName = "Scope_$ipStart"
-    $scopeId   = $ipStart
-
-    # Asignar IP al servidor
-    $adapter = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
-    if ($adapter) {
-        Write-Host "Configurando IP $ipStart en adaptador $($adapter.Name)..."
-        $existing = Get-NetIPAddress -InterfaceAlias $adapter.Name -AddressFamily IPv4 -ErrorAction SilentlyContinue
-        if ($existing) {
-            Remove-NetIPAddress -InterfaceAlias $adapter.Name -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
-        }
-        New-NetIPAddress -InterfaceAlias $adapter.Name -IPAddress $ipStart -PrefixLength 24 -DefaultGateway $gateway -ErrorAction SilentlyContinue | Out-Null
+    $existingIPs = Get-NetIPAddress -InterfaceAlias "Ethernet 2" -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    foreach ($eip in $existingIPs) {
+        Remove-NetIPAddress -InterfaceAlias "Ethernet 2" -IPAddress $eip.IPAddress -Confirm:$false -ErrorAction SilentlyContinue
     }
 
-    # Crear o actualizar scope
+    $existingGW = Get-NetRoute -InterfaceAlias "Ethernet 2" -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue
+    if ($existingGW) {
+        Remove-NetRoute -InterfaceAlias "Ethernet 2" -DestinationPrefix "0.0.0.0/0" -Confirm:$false -ErrorAction SilentlyContinue
+    }
+
+    New-NetIPAddress -InterfaceAlias "Ethernet 2" -IPAddress $ipStart -PrefixLength $prefix -DefaultGateway $gateway -ErrorAction SilentlyContinue | Out-Null
+
+    # DNS en la interfaz sin validar si existe
+    Set-DnsClientServerAddress -InterfaceAlias "Ethernet 2" -ServerAddresses $dns1,$dns2
+
+    # Scope DHCP
+    $scopeId = $ipStart
+
     $existing = Get-DhcpServerv4Scope -ScopeId $scopeId -ErrorAction SilentlyContinue
     if ($existing) {
         Write-Host "El scope $scopeId ya existe. Eliminando para reconfigurar..."
         Remove-DhcpServerv4Scope -ScopeId $scopeId -Force
     }
 
-    Add-DhcpServerv4Scope -Name $scopeName -StartRange $poolStart -EndRange $ipEnd -SubnetMask $mask -LeaseDuration ([TimeSpan]::FromHours([int]$lease)) -State Active
+    Add-DhcpServerv4Scope -Name "Scope_$ipStart" -StartRange $poolStart -EndRange $ipEnd `
+        -SubnetMask $mask -LeaseDuration ([TimeSpan]::FromHours([int]$lease)) -State Active
 
     Set-DhcpServerv4OptionValue -ScopeId $scopeId -Router $gateway -DnsServer $dns1,$dns2
 
     Write-Host ""
     Write-Host "DHCP configurado correctamente."
-    Write-Host "  Scope     : $scopeName"
+    Write-Host "  Interfaz  : Ethernet 2"
     Write-Host "  Servidor  : $ipStart"
     Write-Host "  Rango     : $poolStart - $ipEnd"
     Write-Host "  Mascara   : $mask"
