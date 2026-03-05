@@ -1,12 +1,10 @@
 #!/bin/bash
 
-# Función para verificar privilegios de root
+# Verificar privilegios de root
 if [ "$EUID" -ne 0 ]; then 
   echo "Por favor, ejecute como root"
   exit
 fi
-
-# --- FUNCIONES ---
 
 function instalar_configurar_ftp() {
     echo "--- Configurando vsftpd e Idempotencia ---"
@@ -15,13 +13,21 @@ function instalar_configurar_ftp() {
         zypper install -y vsftpd
     fi
 
+    # 1. Crear origen central de carpetas compartidas
     mkdir -p /srv/ftp/general
-    chmod 777 /srv/ftp/general
+    mkdir -p /srv/ftp/reprobados
+    mkdir -p /srv/ftp/recursadores
     
+    # Permisos para que los grupos puedan escribir en sus carpetas compartidas
     groupadd -f reprobados
     groupadd -f recursadores
+    
+    chown root:reprobados /srv/ftp/reprobados
+    chown root:recursadores /srv/ftp/recursadores
+    chmod 777 /srv/ftp/general
+    chmod 770 /srv/ftp/reprobados /srv/ftp/recursadores
 
-    # Configuración optimizada para evitar errores de conexión en FileZilla
+    # Configuración vsftpd
     cat <<EOF > /etc/vsftpd.conf
 listen=YES
 listen_ipv6=NO
@@ -44,15 +50,14 @@ pam_service_name=vsftpd
 seccomp_sandbox=NO
 EOF
 
-    # Abrir Firewall (Crítico para FileZilla)
-    echo "Configurando Firewall..."
+    # Firewall
     firewall-cmd --permanent --add-service=ftp 2>/dev/null
     firewall-cmd --permanent --add-port=40000-40100/tcp 2>/dev/null
     firewall-cmd --reload 2>/dev/null
 
     systemctl enable vsftpd
     systemctl restart vsftpd
-    echo "Servicio reiniciado y puertos abiertos."
+    echo "Servicio listo y carpetas maestras creadas en /srv/ftp."
 }
 
 function gestionar_usuarios() {
@@ -70,62 +75,67 @@ function gestionar_usuarios() {
         fi
         echo "$username:$password" | chpasswd
 
-        # Estructura de carpetas
+        # Crear puntos de montaje en el HOME del usuario
         mkdir -p "$user_home/general" "$user_home/$grupo" "$user_home/$username"
-        chown -R "$username:$grupo" "$user_home"
+        
+        # Realizar montajes BIND (Esto vincula la carpeta del usuario a la compartida)
+        mount --bind /srv/ftp/general "$user_home/general"
+        mount --bind "/srv/ftp/$grupo" "$user_home/$grupo"
+
+        chown -R "$username:$grupo" "$user_home/$username"
         chmod 755 "$user_home"
-        chmod 770 "$user_home/$username" "$user_home/$grupo"
-        chmod 777 "$user_home/general"
+        echo "Usuario $username creado y vinculado a carpetas compartidas."
     done
 }
 
 function cambiar_grupo_usuario() {
     read -p "Nombre del usuario a modificar: " username
-    if ! id "$username" &>/dev/null; then
-        echo "El usuario no existe."
-        return
-    fi
+    if ! id "$username" &>/dev/null; then echo "No existe"; return; fi
 
+    viejo_grupo=$(id -gn "$username")
     echo "Nuevo Grupo: 1) reprobados | 2) recursadores"
     read -p "Opcion: " g_opt
     nuevo_grupo=$([ "$g_opt" == "1" ] && echo "reprobados" || echo "recursadores")
-    viejo_grupo=$(id -gn "$username")
 
-    if [ "$nuevo_grupo" == "$viejo_grupo" ]; then
-        echo "El usuario ya pertenece a este grupo."
-        return
-    fi
+    [ "$nuevo_grupo" == "$viejo_grupo" ] && echo "Ya es de ese grupo" && return
 
-    # 1. Cambiar grupo en el sistema
-    usermod -g "$nuevo_grupo" "$username"
-    
-    # 2. Renombrar carpeta de grupo antigua por la nueva
     user_home="/home/ftp_users/$username"
-    mv "$user_home/$viejo_grupo" "$user_home/$nuevo_grupo" 2>/dev/null || mkdir -p "$user_home/$nuevo_grupo"
-    
-    # 3. Reasignar permisos
-    chown -R "$username:$nuevo_grupo" "$user_home"
-    echo "Usuario $username movido exitosamente de $viejo_grupo a $nuevo_grupo."
+
+    # 1. Desmontar carpeta del grupo viejo y borrar el directorio vacío
+    umount "$user_home/$viejo_grupo" 2>/dev/null
+    rmdir "$user_home/$viejo_grupo"
+
+    # 2. Cambiar grupo en sistema
+    usermod -g "$nuevo_grupo" "$username"
+
+    # 3. Crear nuevo directorio y montar el nuevo grupo
+    mkdir -p "$user_home/$nuevo_grupo"
+    mount --bind "/srv/ftp/$nuevo_grupo" "$user_home/$nuevo_grupo"
+
+    echo "Cambio aplicado: Ahora el usuario ve la carpeta de $nuevo_grupo."
 }
 
 function listar_usuarios() {
-    echo -e "\nUSUARIO\t\tGRUPO\t\tHOME"
+    echo -e "\nUSUARIO\t\tGRUPO"
     getent passwd | awk -F: '$3 >= 1000 {print $1}' | while read user; do
         grp=$(id -gn "$user")
-        if [[ "$grp" == "reprobados" || "$grp" == "recursadores" ]]; then
-            home=$(getent passwd "$user" | cut -d: -f6)
-            echo -e "$user\t\t$grp\t$home"
-        fi
+        [[ "$grp" == "reprobados" || "$grp" == "recursadores" ]] && echo -e "$user\t\t$grp"
     done
 }
 
 function borrar_todo() {
     systemctl stop vsftpd
-    listar_usuarios | awk '{print $1}' | xargs -I {} userdel -r {} 2>/dev/null
+    # Desmontar todo antes de borrar
+    mount | grep /home/ftp_users | cut -d' ' -f3 | xargs umount 2>/dev/null
+    
+    getent passwd | awk -F: '$3 >= 1000 {print $1}' | while read user; do
+        grp=$(id -gn "$user")
+        [[ "$grp" == "reprobados" || "$grp" == "recursadores" ]] && userdel -r "$user" 2>/dev/null
+    done
     rm -rf /home/ftp_users /srv/ftp
     groupdel reprobados 2>/dev/null
     groupdel recursadores 2>/dev/null
-    echo "Todo borrado."
+    echo "Sistema limpio."
 }
 
 # --- MENU ---
