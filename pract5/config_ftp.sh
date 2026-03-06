@@ -4,7 +4,6 @@
 # SCRIPT FTP COLABORATIVO - OpenSUSE LEAP (BIND MOUNT + SGID)
 # =================================================================
 
-# Verificar privilegios de root
 if [ "$EUID" -ne 0 ]; then 
   echo "Por favor, ejecute como root"
   exit
@@ -17,7 +16,6 @@ function instalar_configurar_ftp() {
     rpm -q vsftpd &>/dev/null || zypper install -y vsftpd
 
     # 2. Crear Origen Central (El Almacén Real)
-    # Creamos las carpetas que serán compartidas por todos
     mkdir -p /srv/ftp/general
     mkdir -p /srv/ftp/reprobados
     mkdir -p /srv/ftp/recursadores
@@ -25,21 +23,28 @@ function instalar_configurar_ftp() {
     # Crear grupos si no existen
     groupadd -f reprobados
     groupadd -f recursadores
-    
-    # PERMISOS CRÍTICOS (SGID + Grupo Escritura):
-    # El '2' en 2775 hace que todo archivo nuevo herede el grupo de la carpeta.
-    
-    # Carpeta General: Todos los usuarios (otros) pueden escribir
-    chown root:reprobados /srv/ftp/general
-    chmod 2777 /srv/ftp/general
-    
-    # Carpeta Reprobados: Solo root y el grupo reprobados
+    groupadd -f ftp 2>/dev/null
+
+    # ---------------------------------------------------------------
+    # PERMISOS CRÍTICOS:
+    # - SGID (2xxx): archivos nuevos heredan el grupo de la carpeta
+    # - Sticky (1xxx): solo el dueño del archivo puede borrarlo
+    # - 3xxx = SGID + Sticky combinados
+    # Esto permite escribir archivos pero NO borrar carpetas del servidor
+    # ---------------------------------------------------------------
+
+    # Carpeta General: todos los usuarios autenticados pueden escribir
+    # El grupo 'ftp' es el denominador común entre todos los usuarios
+    chown root:ftp /srv/ftp/general
+    chmod 3775 /srv/ftp/general   # SGID + Sticky + rwxrwxr-x
+
+    # Carpeta Reprobados: solo root y el grupo reprobados
     chown root:reprobados /srv/ftp/reprobados
-    chmod 2770 /srv/ftp/reprobados
-    
-    # Carpeta Recursadores: Solo root y el grupo recursadores
+    chmod 3770 /srv/ftp/reprobados  # SGID + Sticky + rwxrwx---
+
+    # Carpeta Recursadores: solo root y el grupo recursadores
     chown root:recursadores /srv/ftp/recursadores
-    chmod 2770 /srv/ftp/recursadores
+    chmod 3770 /srv/ftp/recursadores  # SGID + Sticky + rwxrwx---
 
     # 3. Configuración vsftpd.conf
     cat <<EOF > /etc/vsftpd.conf
@@ -48,9 +53,12 @@ listen_ipv6=NO
 anonymous_enable=YES
 anon_root=/srv/ftp/general
 no_anon_password=YES
+anon_upload_enable=NO
+anon_mkdir_write_enable=NO
 local_enable=YES
 write_enable=YES
 local_umask=002
+file_open_mode=0664
 dirmessage_enable=YES
 use_localtime=YES
 xferlog_enable=YES
@@ -64,7 +72,7 @@ pam_service_name=vsftpd
 seccomp_sandbox=NO
 EOF
 
-    # 4. Firewall (Abrir puertos para FileZilla)
+    # 4. Firewall
     firewall-cmd --permanent --add-service=ftp 2>/dev/null
     firewall-cmd --permanent --add-port=40000-40100/tcp 2>/dev/null
     firewall-cmd --reload 2>/dev/null
@@ -85,9 +93,14 @@ function gestionar_usuarios() {
 
         user_home="/home/ftp_users/$username"
         
-        # Crear usuario
+        # Crear usuario:
+        # -g: grupo primario = su grupo (reprobados o recursadores)
+        # -G: grupos secundarios = ftp (para acceso a /srv/ftp/general)
         if ! id "$username" &>/dev/null; then
-            useradd -m -d "$user_home" -g "$grupo" -s /sbin/nologin "$username"
+            useradd -m -d "$user_home" -g "$grupo" -G ftp -s /sbin/nologin "$username"
+        else
+            # Si ya existe, asegurar que tenga el grupo ftp como secundario
+            usermod -G ftp "$username"
         fi
         echo "$username:$password" | chpasswd
 
@@ -96,17 +109,30 @@ function gestionar_usuarios() {
         
         # Realizar montajes BIND
         mountpoint -q "$user_home/general" || mount --bind /srv/ftp/general "$user_home/general"
-        mountpoint -q "$user_home/$grupo" || mount --bind "/srv/ftp/$grupo" "$user_home/$grupo"
+        mountpoint -q "$user_home/$grupo"  || mount --bind "/srv/ftp/$grupo" "$user_home/$grupo"
 
-        # Persistencia en fstab (Para que no se borren al reiniciar)
-        grep -q "$user_home/general" /etc/fstab || echo "/srv/ftp/general $user_home/general none bind 0 0" >> /etc/fstab
-        grep -q "$user_home/$grupo" /etc/fstab || echo "/srv/ftp/$grupo $user_home/$grupo none bind 0 0" >> /etc/fstab
+        # ---------------------------------------------------------------
+        # FIX CRÍTICO: Tras el bind mount, aplicar permisos en el punto
+        # de montaje para que el usuario pueda escribir vía su grupo.
+        # Esto no afecta /srv/ftp/ sino solo la vista del usuario.
+        # ---------------------------------------------------------------
+        chown root:ftp "$user_home/general"
+        chmod 3775 "$user_home/general"
 
-        # Permisos de la carpeta personal (Privada)
+        chown root:"$grupo" "$user_home/$grupo"
+        chmod 3770 "$user_home/$grupo"
+
+        # Persistencia en fstab
+        grep -q "$user_home/general" /etc/fstab || \
+            echo "/srv/ftp/general $user_home/general none bind 0 0" >> /etc/fstab
+        grep -q "$user_home/$grupo" /etc/fstab || \
+            echo "/srv/ftp/$grupo $user_home/$grupo none bind 0 0" >> /etc/fstab
+
+        # Carpeta personal del usuario (solo él y su grupo pueden entrar)
         chown "$username:$grupo" "$user_home/$username"
         chmod 770 "$user_home/$username"
         
-        # El HOME no debe ser escribible por el usuario para evitar errores de chroot en algunas versiones
+        # El HOME raíz debe ser de root y no escribible (requisito de chroot)
         chown root:root "$user_home"
         chmod 755 "$user_home"
 
@@ -133,12 +159,16 @@ function cambiar_grupo_usuario() {
     sed -i "\|$user_home/$viejo_grupo|d" /etc/fstab
     rm -rf "$user_home/$viejo_grupo"
 
-    # 2. Cambiar grupo en sistema
+    # 2. Cambiar grupo primario en el sistema
     usermod -g "$nuevo_grupo" "$username"
+    # Mantener ftp como grupo secundario para acceso a general
+    usermod -G ftp "$username"
 
-    # 3. Vincular nuevo grupo
+    # 3. Vincular nuevo grupo y aplicar permisos en el punto de montaje
     mkdir -p "$user_home/$nuevo_grupo"
     mount --bind "/srv/ftp/$nuevo_grupo" "$user_home/$nuevo_grupo"
+    chown root:"$nuevo_grupo" "$user_home/$nuevo_grupo"
+    chmod 3770 "$user_home/$nuevo_grupo"
     echo "/srv/ftp/$nuevo_grupo $user_home/$nuevo_grupo none bind 0 0" >> /etc/fstab
 
     # 4. Actualizar dueño de la carpeta personal al nuevo grupo
@@ -164,7 +194,7 @@ function borrar_todo() {
     systemctl stop vsftpd
     
     # Desmontar todos los binds activos
-    mount | grep /home/ftp_users | cut -d' ' -f3 | xargs umount -l 2>/dev/null
+    mount | grep /home/ftp_users | awk '{print $3}' | xargs umount -l 2>/dev/null
     
     # Limpiar fstab
     sed -i '\|/home/ftp_users|d' /etc/fstab
@@ -187,7 +217,8 @@ function borrar_todo() {
 
 # --- MENU PRINCIPAL ---
 while true; do
-    echo "  GESTIÓN FTP "
+    echo ""
+    echo "===== GESTIÓN FTP ====="
     echo "1. Configurar Servidor FTP e Idempotencia"
     echo "2. Crear Usuarios (n)"
     echo "3. Cambiar Usuario de Grupo"
