@@ -1,238 +1,302 @@
 #!/bin/bash
+# =================================================================
+# SCRIPT FTP - OpenSUSE LEAP - vsftpd
+# Grupos: reprobados / recursadores
+# Acceso anónimo: solo lectura en /general
+# Acceso autenticado: escritura en /general, grupo y personal
+# =================================================================
+
+[ "$EUID" -ne 0 ] && echo "Ejecute como root." && exit 1
+
+# --- RUTAS Y VARIABLES GLOBALES ---
+FTP_ROOT="/srv/ftp"
+USERS_HOME="/home/ftp_users"
+GRUPOS=("reprobados" "recursadores")
 
 # =================================================================
-# SCRIPT FTP COLABORATIVO - OpenSUSE LEAP (BIND MOUNT + SGID)
+# 1. INSTALAR Y CONFIGURAR VSFTPD
 # =================================================================
+function instalar_configurar() {
+    echo ""
+    echo "=== Instalando y configurando vsftpd ==="
 
-if [ "$EUID" -ne 0 ]; then 
-  echo "Por favor, ejecute como root"
-  exit
-fi
-
-function instalar_configurar_ftp() {
-    echo "--- Configurando vsftpd, Firewall y Carpetas Maestras ---"
-    
-    # 1. Instalación idempotente
+    # Instalación idempotente
     rpm -q vsftpd &>/dev/null || zypper install -y vsftpd
 
-    # 2. Crear Origen Central (El Almacén Real)
-    mkdir -p /srv/ftp/general
-    mkdir -p /srv/ftp/reprobados
-    mkdir -p /srv/ftp/recursadores
-    
     # Crear grupos si no existen
-    groupadd -f reprobados
-    groupadd -f recursadores
-    groupadd -f ftp 2>/dev/null
+    for g in "${GRUPOS[@]}"; do
+        getent group "$g" &>/dev/null || groupadd "$g"
+        echo "Grupo '$g' listo."
+    done
 
-    # ---------------------------------------------------------------
-    # PERMISOS CRÍTICOS:
-    # - SGID (2xxx): archivos nuevos heredan el grupo de la carpeta
-    # - Sticky (1xxx): solo el dueño del archivo puede borrarlo
-    # - 3xxx = SGID + Sticky combinados
-    # Esto permite escribir archivos pero NO borrar carpetas del servidor
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------
+    # CARPETAS MAESTRAS (almacén real de datos)
+    # -------------------------------------------------------
+    mkdir -p "$FTP_ROOT/general"
+    mkdir -p "$FTP_ROOT/reprobados"
+    mkdir -p "$FTP_ROOT/recursadores"
 
-    # Carpeta General: todos los usuarios autenticados pueden escribir
-    # El grupo 'ftp' es el denominador común entre todos los usuarios
-    chown root:ftp /srv/ftp/general
-    chmod 3775 /srv/ftp/general   # SGID + Sticky + rwxrwxr-x
+    # /general → grupo 'ftp', todos los usuarios autenticados escriben
+    # chmod 3775: SGID (hereda grupo) + Sticky (no borrar ajeno) + rwxrwxr-x
+    chown root:ftp "$FTP_ROOT/general"
+    chmod 3775 "$FTP_ROOT/general"
 
-    # Carpeta Reprobados: solo root y el grupo reprobados
-    chown root:reprobados /srv/ftp/reprobados
-    chmod 3770 /srv/ftp/reprobados  # SGID + Sticky + rwxrwx---
+    # /reprobados y /recursadores → solo su grupo escribe
+    # chmod 3770: SGID + Sticky + rwxrwx---
+    chown root:reprobados "$FTP_ROOT/reprobados"
+    chmod 3770 "$FTP_ROOT/reprobados"
 
-    # Carpeta Recursadores: solo root y el grupo recursadores
-    chown root:recursadores /srv/ftp/recursadores
-    chmod 3770 /srv/ftp/recursadores  # SGID + Sticky + rwxrwx---
+    chown root:recursadores "$FTP_ROOT/recursadores"
+    chmod 3770 "$FTP_ROOT/recursadores"
 
-    # 3. Configuración vsftpd.conf
-    cat <<EOF > /etc/vsftpd.conf
+    # -------------------------------------------------------
+    # CONFIGURACIÓN VSFTPD.CONF
+    # -------------------------------------------------------
+    cat > /etc/vsftpd.conf <<EOF
+# --- Modo de escucha ---
 listen=YES
 listen_ipv6=NO
+
+# --- Acceso anónimo (solo lectura a /general) ---
 anonymous_enable=YES
-anon_root=/srv/ftp/general
+anon_root=$FTP_ROOT/general
 no_anon_password=YES
 anon_upload_enable=NO
 anon_mkdir_write_enable=NO
+
+# --- Usuarios locales autenticados ---
 local_enable=YES
 write_enable=YES
 local_umask=002
 file_open_mode=0664
+
+# --- Chroot: cada usuario ve solo su HOME ---
+chroot_local_user=YES
+allow_writeable_chroot=YES
+
+# --- Seguridad y logs ---
 dirmessage_enable=YES
 use_localtime=YES
 xferlog_enable=YES
 connect_from_port_20=YES
-chroot_local_user=YES
-allow_writeable_chroot=YES
+pam_service_name=vsftpd
+seccomp_sandbox=NO
+
+# --- Modo pasivo (para FileZilla) ---
 pasv_enable=YES
 pasv_min_port=40000
 pasv_max_port=40100
-pam_service_name=vsftpd
-seccomp_sandbox=NO
 EOF
 
-    # 4. Firewall
-    firewall-cmd --permanent --add-service=ftp 2>/dev/null
-    firewall-cmd --permanent --add-port=40000-40100/tcp 2>/dev/null
-    firewall-cmd --reload 2>/dev/null
+    # Firewall
+    firewall-cmd --permanent --add-service=ftp       &>/dev/null
+    firewall-cmd --permanent --add-port=40000-40100/tcp &>/dev/null
+    firewall-cmd --reload                              &>/dev/null
 
-    systemctl enable vsftpd && systemctl restart vsftpd
-    echo "Servicio iniciado. Carpetas maestras listas en /srv/ftp."
+    systemctl enable vsftpd
+    systemctl restart vsftpd
+
+    echo ""
+    echo "vsftpd configurado y activo."
+    echo "Carpetas maestras listas en $FTP_ROOT"
 }
 
-function gestionar_usuarios() {
-    read -p "Numero de usuarios a crear: " n
-    for (( i=1; i<=$n; i++ )); do
-        echo -e "\n--- Configurando Usuario $i ---"
+# =================================================================
+# 2. CREAR USUARIOS
+# Estructura visible por FTP al hacer login:
+#   /general
+#   /reprobados  o  /recursadores
+#   /nombre_usuario
+# =================================================================
+function crear_usuarios() {
+    read -p "Número de usuarios a crear: " n
+
+    for (( i=1; i<=n; i++ )); do
+        echo ""
+        echo "--- Usuario $i de $n ---"
         read -p "Nombre de usuario: " username
-        read -s -p "Password: " password; echo ""
-        echo "Grupo: 1) reprobados | 2) recursadores"
-        read -p "Opcion: " g_opt
+        read -s -p "Contraseña: " password; echo ""
+
+        echo "Grupo: 1) reprobados  2) recursadores"
+        read -p "Opción: " g_opt
         grupo=$([ "$g_opt" == "1" ] && echo "reprobados" || echo "recursadores")
 
-        user_home="/home/ftp_users/$username"
-        
-        # Crear usuario:
-        # -g: grupo primario = su grupo (reprobados o recursadores)
-        # -G: grupos secundarios = ftp (para acceso a /srv/ftp/general)
+        user_home="$USERS_HOME/$username"
+
+        # --- Crear usuario del sistema ---
         if ! id "$username" &>/dev/null; then
-            useradd -m -d "$user_home" -g "$grupo" -G ftp -s /sbin/nologin "$username"
+            useradd -m -d "$user_home" \
+                    -g "$grupo"        \
+                    -G ftp             \
+                    -s /sbin/nologin   \
+                    "$username"
         else
-            # Si ya existe, asegurar que tenga el grupo ftp como secundario
-            usermod -G ftp "$username"
+            # Si ya existe, asegurar grupos correctos
+            usermod -g "$grupo" -G ftp "$username"
         fi
         echo "$username:$password" | chpasswd
 
-        # Crear subdirectorios en el HOME (Puntos de montaje)
-        mkdir -p "$user_home/general" "$user_home/$grupo" "$user_home/$username"
-        
-        # Realizar montajes BIND
-        mountpoint -q "$user_home/general" || mount --bind /srv/ftp/general "$user_home/general"
-        mountpoint -q "$user_home/$grupo"  || mount --bind "/srv/ftp/$grupo" "$user_home/$grupo"
+        # --- Crear estructura de carpetas (puntos de montaje) ---
+        mkdir -p "$user_home/general"
+        mkdir -p "$user_home/$grupo"
+        mkdir -p "$user_home/$username"
 
-        # ---------------------------------------------------------------
-        # FIX CRÍTICO: Tras el bind mount, aplicar permisos en el punto
-        # de montaje para que el usuario pueda escribir vía su grupo.
-        # Esto no afecta /srv/ftp/ sino solo la vista del usuario.
-        # ---------------------------------------------------------------
+        # --- BIND MOUNTS: conectar vistas del usuario con el almacén real ---
+        mountpoint -q "$user_home/general" || \
+            mount --bind "$FTP_ROOT/general" "$user_home/general"
+
+        mountpoint -q "$user_home/$grupo" || \
+            mount --bind "$FTP_ROOT/$grupo" "$user_home/$grupo"
+
+        # Persistencia en fstab (sobrevive reinicios)
+        grep -q "$user_home/general" /etc/fstab || \
+            echo "$FTP_ROOT/general $user_home/general none bind 0 0" >> /etc/fstab
+
+        grep -q "$user_home/$grupo" /etc/fstab || \
+            echo "$FTP_ROOT/$grupo $user_home/$grupo none bind 0 0" >> /etc/fstab
+
+        # --- Permisos de las carpetas montadas ---
+        # /general: el usuario pertenece al grupo ftp → puede escribir
         chown root:ftp "$user_home/general"
         chmod 3775 "$user_home/general"
 
+        # /grupo: el usuario pertenece a su grupo → puede escribir
         chown root:"$grupo" "$user_home/$grupo"
         chmod 3770 "$user_home/$grupo"
 
-        # Persistencia en fstab
-        grep -q "$user_home/general" /etc/fstab || \
-            echo "/srv/ftp/general $user_home/general none bind 0 0" >> /etc/fstab
-        grep -q "$user_home/$grupo" /etc/fstab || \
-            echo "/srv/ftp/$grupo $user_home/$grupo none bind 0 0" >> /etc/fstab
-
-        # Carpeta personal del usuario (solo él y su grupo pueden entrar)
+        # /personal: solo el usuario y su grupo
         chown "$username:$grupo" "$user_home/$username"
         chmod 770 "$user_home/$username"
-        
-        # El HOME raíz debe ser de root y no escribible (requisito de chroot)
+
+        # HOME raíz: debe ser de root y no escribible (requisito chroot vsftpd)
         chown root:root "$user_home"
         chmod 755 "$user_home"
 
-        echo "Usuario $username creado exitosamente."
+        echo "✓ Usuario '$username' creado en grupo '$grupo'."
     done
 }
 
-function cambiar_grupo_usuario() {
+# =================================================================
+# 3. CAMBIAR GRUPO DE USUARIO
+# =================================================================
+function cambiar_grupo() {
     read -p "Nombre del usuario: " username
-    if ! id "$username" &>/dev/null; then echo "Usuario no existe"; return; fi
+    id "$username" &>/dev/null || { echo "Usuario no existe."; return; }
 
     viejo_grupo=$(id -gn "$username")
-    echo "Nuevo Grupo: 1) reprobados | 2) recursadores"
-    read -p "Opcion: " g_opt
+    if [[ "$viejo_grupo" != "reprobados" && "$viejo_grupo" != "recursadores" ]]; then
+        echo "El usuario no pertenece a reprobados ni recursadores."
+        return
+    fi
+
+    echo "Nuevo grupo: 1) reprobados  2) recursadores"
+    read -p "Opción: " g_opt
     nuevo_grupo=$([ "$g_opt" == "1" ] && echo "reprobados" || echo "recursadores")
 
-    if [ "$nuevo_grupo" == "$viejo_grupo" ]; then echo "Ya es de ese grupo"; return; fi
+    [ "$nuevo_grupo" == "$viejo_grupo" ] && echo "Ya pertenece a ese grupo." && return
 
-    user_home="/home/ftp_users/$username"
+    user_home="$USERS_HOME/$username"
 
-    # 1. Desmontar grupo viejo
-    echo "Desvinculando grupo $viejo_grupo..."
+    # 1. Desmontar y eliminar carpeta del grupo viejo
+    echo "Desvinculando '$viejo_grupo'..."
     umount -l "$user_home/$viejo_grupo" 2>/dev/null
     sed -i "\|$user_home/$viejo_grupo|d" /etc/fstab
     rm -rf "$user_home/$viejo_grupo"
 
-    # 2. Cambiar grupo primario en el sistema
+    # 2. Cambiar grupo primario del usuario
     usermod -g "$nuevo_grupo" "$username"
-    # Mantener ftp como grupo secundario para acceso a general
-    usermod -G ftp "$username"
 
-    # 3. Vincular nuevo grupo y aplicar permisos en el punto de montaje
+    # 3. Crear y montar carpeta del nuevo grupo
     mkdir -p "$user_home/$nuevo_grupo"
-    mount --bind "/srv/ftp/$nuevo_grupo" "$user_home/$nuevo_grupo"
+    mount --bind "$FTP_ROOT/$nuevo_grupo" "$user_home/$nuevo_grupo"
+    echo "$FTP_ROOT/$nuevo_grupo $user_home/$nuevo_grupo none bind 0 0" >> /etc/fstab
+
+    # 4. Aplicar permisos en el nuevo punto de montaje
     chown root:"$nuevo_grupo" "$user_home/$nuevo_grupo"
     chmod 3770 "$user_home/$nuevo_grupo"
-    echo "/srv/ftp/$nuevo_grupo $user_home/$nuevo_grupo none bind 0 0" >> /etc/fstab
 
-    # 4. Actualizar dueño de la carpeta personal al nuevo grupo
+    # 5. Actualizar permisos de carpeta personal
     chown "$username:$nuevo_grupo" "$user_home/$username"
 
-    echo "Cambio completado. El usuario $username ahora pertenece a $nuevo_grupo."
+    echo "✓ '$username' ahora pertenece a '$nuevo_grupo'."
 }
 
+# =================================================================
+# 4. LISTAR USUARIOS
+# =================================================================
 function listar_usuarios() {
-    echo -e "\nUSUARIO\t\tGRUPO\t\tESTADO MONTAJE"
-    echo "--------------------------------------------------------"
-    getent passwd | awk -F: '$3 >= 1000 {print $1}' | while read user; do
-        grp=$(id -gn "$user")
+    echo ""
+    printf "%-15s %-15s %-12s\n" "USUARIO" "GRUPO" "MONTAJE"
+    echo "-------------------------------------------"
+    getent passwd | awk -F: '$3 >= 1000 && $6 ~ /ftp_users/ {print $1}' | \
+    while read user; do
+        grp=$(id -gn "$user" 2>/dev/null)
         if [[ "$grp" == "reprobados" || "$grp" == "recursadores" ]]; then
-            status=$(mountpoint -q "/home/ftp_users/$user/$grp" && echo "VINCULADO" || echo "DESCONECTADO")
-            echo -e "$user\t\t$grp\t\t$status"
+            mnt=$(mountpoint -q "$USERS_HOME/$user/$grp" && echo "ACTIVO" || echo "INACTIVO")
+            printf "%-15s %-15s %-12s\n" "$user" "$grp" "$mnt"
         fi
     done
 }
 
+# =================================================================
+# 5. BORRAR TODO
+# =================================================================
 function borrar_todo() {
-    echo "Iniciando limpieza total..."
+    read -p "¿Confirma borrado total? (s/N): " confirm
+    [[ "$confirm" != "s" && "$confirm" != "S" ]] && echo "Cancelado." && return
+
+    echo "Limpiando sistema..."
+
     systemctl stop vsftpd
-    
-    # Desmontar todos los binds activos
-    mount | grep /home/ftp_users | awk '{print $3}' | xargs umount -l 2>/dev/null
-    
+
+    # Desmontar todos los bind mounts activos
+    mount | grep "$USERS_HOME" | awk '{print $3}' | \
+        xargs -I{} umount -l {} 2>/dev/null
+
     # Limpiar fstab
-    sed -i '\|/home/ftp_users|d' /etc/fstab
-    
-    # Borrar usuarios de los grupos específicos
-    getent passwd | awk -F: '$3 >= 1000 {print $1}' | while read user; do
-        grp=$(id -gn "$user")
+    sed -i "\|$USERS_HOME|d" /etc/fstab
+
+    # Eliminar usuarios FTP
+    getent passwd | awk -F: '$3 >= 1000 && $6 ~ /ftp_users/ {print $1}' | \
+    while read user; do
+        grp=$(id -gn "$user" 2>/dev/null)
         if [[ "$grp" == "reprobados" || "$grp" == "recursadores" ]]; then
             userdel -r "$user" 2>/dev/null
+            echo "Usuario '$user' eliminado."
         fi
     done
 
-    # Borrar directorios y grupos
-    rm -rf /home/ftp_users /srv/ftp
-    groupdel reprobados 2>/dev/null
+    # Eliminar directorios y grupos
+    rm -rf "$USERS_HOME" "$FTP_ROOT"
+    groupdel reprobados   2>/dev/null
     groupdel recursadores 2>/dev/null
-    
-    echo "Sistema limpio y configuración eliminada."
+
+    echo "✓ Limpieza completa."
 }
 
-# --- MENU PRINCIPAL ---
+# =================================================================
+# MENÚ PRINCIPAL
+# =================================================================
 while true; do
     echo ""
-    echo "===== GESTIÓN FTP ====="
-    echo "1. Configurar Servidor FTP e Idempotencia"
-    echo "2. Crear Usuarios (n)"
-    echo "3. Cambiar Usuario de Grupo"
-    echo "4. Listar Usuarios"
-    echo "5. Borrar Todo (Limpieza)"
-    echo "6. Salir"
-    read -p "Seleccione una opción: " op
+    echo "╔══════════════════════════════╗"
+    echo "║      GESTIÓN FTP - vsftpd    ║"
+    echo "╠══════════════════════════════╣"
+    echo "║ 1. Instalar y Configurar     ║"
+    echo "║ 2. Crear Usuarios            ║"
+    echo "║ 3. Cambiar Grupo de Usuario  ║"
+    echo "║ 4. Listar Usuarios           ║"
+    echo "║ 5. Borrar Todo               ║"
+    echo "║ 6. Salir                     ║"
+    echo "╚══════════════════════════════╝"
+    read -p "Opción: " op
     case $op in
-        1) instalar_configurar_ftp ;;
-        2) gestionar_usuarios ;;
-        3) cambiar_grupo_usuario ;;
-        4) listar_usuarios ;;
-        5) borrar_todo ;;
-        6) exit 0 ;;
+        1) instalar_configurar ;;
+        2) crear_usuarios      ;;
+        3) cambiar_grupo       ;;
+        4) listar_usuarios     ;;
+        5) borrar_todo         ;;
+        6) exit 0              ;;
         *) echo "Opción no válida." ;;
     esac
 done
