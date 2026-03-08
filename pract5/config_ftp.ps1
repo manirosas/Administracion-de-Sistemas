@@ -296,8 +296,23 @@ function Crear-Usuarios {
         # Agregar a su grupo y al grupo ftp_users (para acceso a /general)
         Add-LocalGroupMember -Group $grupo      -Member $username -EA SilentlyContinue
         Add-LocalGroupMember -Group "ftp_users" -Member $username -EA SilentlyContinue
-        # Esperar propagacion en SAM antes de aplicar ACLs
-        Start-Sleep -Seconds 3
+        # Esperar que el usuario Y su grupo sean resolvibles por el subsistema de seguridad
+        $maxWait = 15; $elapsed = 0
+        while ($elapsed -lt $maxWait) {
+            try {
+                $null = [System.Security.Principal.NTAccount]("$env:COMPUTERNAME\$username").Translate(
+                    [System.Security.Principal.SecurityIdentifier])
+                $null = [System.Security.Principal.NTAccount]("$env:COMPUTERNAME\$grupo").Translate(
+                    [System.Security.Principal.SecurityIdentifier])
+                break
+            } catch {
+                Start-Sleep -Seconds 1
+                $elapsed++
+            }
+        }
+        if ($elapsed -ge $maxWait) {
+            Write-Host "ADVERTENCIA: Identidades no resueltas tras $maxWait seg." -ForegroundColor Yellow
+        }
 
         # -------------------------------------------------------
         # Estructura de carpetas en IIS UserIsolation
