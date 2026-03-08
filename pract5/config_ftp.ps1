@@ -7,16 +7,22 @@
 # Ejecutar en PowerShell como Administrador
 #Requires -RunAsAdministrator
 
+# =================================================================
 # VARIABLES GLOBALES
+# =================================================================
 $FTP_ROOT   = "C:\srv\ftp"
-$USERS_HOME = "C:\home\ftp_users"
+# IIS UserIsolation busca LocalUser\usuario DENTRO de la raiz del sitio FTP
+# Por eso USERS_HOME debe apuntar al mismo lugar que FTP_ROOT
+$USERS_HOME = "C:\srv\ftp"
 $SITE_NAME  = "FTP_Colaborativo"
 $FTP_PORT   = 21
 $PASV_MIN   = 40000
 $PASV_MAX   = 40100
 $GRUPOS     = @("reprobados", "recursadores")
 
+# =================================================================
 # FUNCIONES AUXILIARES
+# =================================================================
 
 function Existe-Grupo($nombre) {
     try { Get-LocalGroup -Name $nombre -EA Stop | Out-Null; return $true }
@@ -252,6 +258,14 @@ function Crear-Usuarios {
         $grupo = if ($g_opt -eq "1") { "reprobados" } else { "recursadores" }
 
         # --- Crear usuario local (equivalente a useradd -s /sbin/nologin) ---
+        # Deshabilitar temporalmente la politica de complejidad de passwords
+        $tmpCfg = "$env:TEMP\secpol_tmp.cfg"
+        secedit /export /cfg $tmpCfg /quiet
+        (Get-Content $tmpCfg) -replace "PasswordComplexity = 1","PasswordComplexity = 0" |
+            Set-Content $tmpCfg
+        secedit /configure /db "$env:TEMP\secpol.sdb" /cfg $tmpCfg /quiet
+        Remove-Item $tmpCfg -Force -EA SilentlyContinue
+
         if (-not (Existe-Usuario $username)) {
             New-LocalUser -Name $username `
                           -Password $password `
@@ -267,6 +281,8 @@ function Crear-Usuarios {
         # Agregar a su grupo y al grupo ftp_users (para acceso a /general)
         Add-LocalGroupMember -Group $grupo      -Member $username -EA SilentlyContinue
         Add-LocalGroupMember -Group "ftp_users" -Member $username -EA SilentlyContinue
+        # Esperar propagacion en SAM antes de aplicar ACLs
+        Start-Sleep -Seconds 3
 
         # -------------------------------------------------------
         # Estructura de carpetas en IIS UserIsolation
@@ -293,12 +309,12 @@ function Crear-Usuarios {
         # Raiz HOME: el usuario puede listar pero no modificar
         # Equivalente a chown root:root $HOME && chmod 755 $HOME
         Reset-Permisos $iis_home
-        Set-Permiso $iis_home $username "ReadAndExecute"
+        Set-Permiso $iis_home (NombreLocal $username) "ReadAndExecute"
 
         # Carpeta personal: solo el usuario y su grupo
         # Equivalente a chown user:grupo $HOME/username && chmod 770
         Reset-Permisos $dir_priv
-        Set-Permiso $dir_priv $username                "Modify"
+        Set-Permiso $dir_priv (NombreLocal $username)  "Modify"
         Set-Permiso $dir_priv (NombreLocal $grupo)     "Modify"
 
         Write-Host "✓ Usuario '$username' listo en grupo '$grupo'." -ForegroundColor Green
