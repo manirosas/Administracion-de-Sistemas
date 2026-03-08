@@ -116,12 +116,12 @@ function Instalar-Configurar {
         }
     }
     if (-not (Existe-Grupo "ftp_users")) {
-        New-LocalGroup -Name "ftp_users" -Description "Grupo comun FTP (equivalente al grupo ftp en Linux)" | Out-Null
+        New-LocalGroup -Name "ftp_users" -Description "Grupo comun FTP" | Out-Null
         Write-Host "Grupo 'ftp_users' creado." -ForegroundColor Green
     }
 
-    # Esperar propagacion en SAM de Windows
-    Start-Sleep -Seconds 3
+    # Esperar propagacion en SAM de Windows (critico para ACLs)
+    Start-Sleep -Seconds 5
 
     # --- Crear carpetas maestras (equivalente a /srv/ftp/) ---
     foreach ($d in @("general","reprobados","recursadores","anon")) {
@@ -135,6 +135,21 @@ function Instalar-Configurar {
     # PERMISOS NTFS DE CARPETAS MAESTRAS
     # Equivalente a chown/chmod en Linux
     # -------------------------------------------------------
+    # Verificar que los grupos existen antes de aplicar ACLs
+    $maxWait = 15
+    $elapsed = 0
+    while ($elapsed -lt $maxWait) {
+        try {
+            $null = [System.Security.Principal.NTAccount]("$env:COMPUTERNAMEtp_users")
+            break
+        } catch {
+            Start-Sleep -Seconds 1
+            $elapsed++
+        }
+    }
+    if ($elapsed -ge $maxWait) {
+        Write-Host "ADVERTENCIA: Los grupos pueden no estar disponibles aun." -ForegroundColor Yellow
+    }
 
     # /anon → raiz del anonimo, solo lectura para todos (chroot no escribible)
     Reset-Permisos "$FTP_ROOT\anon"
