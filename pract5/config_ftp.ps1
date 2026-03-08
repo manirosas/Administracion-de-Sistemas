@@ -1,9 +1,7 @@
-# =================================================================
 # SCRIPT FTP - Windows Server 2022 - IIS FTP Service
 # Modo: StartInUsersDirectory (compatible con WS2022)
 # Cada usuario ve solo sus carpetas via permisos NTFS
-# =================================================================
-#Requires -RunAsAdministrator
+
 
 # =================================================================
 # VARIABLES GLOBALES
@@ -179,14 +177,14 @@ function Instalar-Configurar {
 
     # Modo aislamiento: StartInUsersDirectory
     # IIS buscara C:\srv\ftp\<usuario>\ para cada usuario
-    [xml]$config = Get-Content "$env:SystemRoot\System32\inetsrv\config\applicationHost.config"
+    [xml]$config = Get-Content "C:\Windows\System32\inetsrv\config\applicationHost.config"
     $s = $config.configuration.'system.applicationHost'.sites.site |
         Where-Object { $_.name -eq $SITE_NAME }
     $s.ftpServer.userIsolation.SetAttribute("mode","StartInUsersDirectory")
-    $config.Save("$env:SystemRoot\System32\inetsrv\config\applicationHost.config")
+    $config.Save("C:\Windows\System32\inetsrv\config\applicationHost.config")
 
     # Puertos pasivos
-    & "$env:SystemRoot\System32\inetsrv\appcmd.exe" set config `
+    & "C:\Windows\System32\inetsrv\appcmd.exe" set config `
         -section:system.ftpServer/firewallSupport `
         /lowDataChannelPort:$PASV_MIN `
         /highDataChannelPort:$PASV_MAX | Out-Null
