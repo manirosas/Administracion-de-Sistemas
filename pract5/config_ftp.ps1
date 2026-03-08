@@ -7,9 +7,7 @@
 # Ejecutar en PowerShell como Administrador
 #Requires -RunAsAdministrator
 
-# =================================================================
 # VARIABLES GLOBALES
-# =================================================================
 $FTP_ROOT   = "C:\srv\ftp"
 $USERS_HOME = "C:\home\ftp_users"
 $SITE_NAME  = "FTP_Colaborativo"
@@ -18,9 +16,7 @@ $PASV_MIN   = 40000
 $PASV_MAX   = 40100
 $GRUPOS     = @("reprobados", "recursadores")
 
-# =================================================================
 # FUNCIONES AUXILIARES
-# =================================================================
 
 function Existe-Grupo($nombre) {
     try { Get-LocalGroup -Name $nombre -EA Stop | Out-Null; return $true }
@@ -182,7 +178,7 @@ function Instalar-Configurar {
     # Equivalente a escribir /etc/vsftpd.conf
     # -------------------------------------------------------
     if (Get-WebSite -Name $SITE_NAME -EA SilentlyContinue) {
-        Stop-WebSite  -Name $SITE_NAME
+        Stop-WebSite   -Name $SITE_NAME -EA SilentlyContinue
         Remove-WebSite -Name $SITE_NAME
     }
 
@@ -200,8 +196,7 @@ function Instalar-Configurar {
     Set-ItemProperty $sitePath -Name ftpServer.security.ssl.dataChannelPolicy    -Value "SslAllow"
 
     # Modo pasivo (equivalente a pasv_min/max_port en vsftpd.conf)
-    Set-ItemProperty $sitePath -Name ftpServer.firewallSupport.pasvMinPort -Value $PASV_MIN
-    Set-ItemProperty $sitePath -Name ftpServer.firewallSupport.pasvMaxPort -Value $PASV_MAX
+    & "$env:SystemRoot\System32\inetsrv\appcmd.exe" set config -section:system.ftpServer/firewallSupport /lowDataChannelPort:$PASV_MIN /highDataChannelPort:$PASV_MAX | Out-Null
 
     # Aislamiento de usuarios: cada uno ve solo su carpeta HOME
     # Equivalente a chroot_local_user=YES en vsftpd
@@ -209,7 +204,6 @@ function Instalar-Configurar {
     Set-ItemProperty $sitePath -Name ftpServer.userIsolation.mode -Value 3
 
     # Directorio del anonimo: /anon (raiz no escribible)
-    Set-ItemProperty $sitePath -Name ftpServer.userIsolation.activeIUserMapper -Value ""
 
     # Reglas de autorizacion FTP
     # Limpiar reglas anteriores
@@ -231,7 +225,7 @@ function Instalar-Configurar {
     netsh advfirewall firewall add    rule name="FTP_Puerto21"  protocol=TCP dir=in localport=21                action=allow | Out-Null
     netsh advfirewall firewall add    rule name="FTP_Pasivo"    protocol=TCP dir=in localport=40000-40100       action=allow | Out-Null
 
-    Start-WebSite -Name $SITE_NAME
+    Start-WebSite -Name $SITE_NAME -EA SilentlyContinue
     Restart-Service ftpsvc -Force
 
     Write-Host "`n✓ Servidor FTP configurado en puerto $FTP_PORT" -ForegroundColor Green
