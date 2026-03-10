@@ -123,15 +123,11 @@ function validateUserName {
     return $true
 }
 
+
 function validatePassword {
     param ([string]$password)
-    $isStrong = $true; $msg = ""
-    if ($password.Length -lt 8)     { $isStrong = $false; $msg += " - Minimo 8 caracteres.`n" }
-    if ($password -notmatch '[A-Z]') { $isStrong = $false; $msg += " - Al menos una mayuscula.`n" }
-    if ($password -notmatch '[0-9]') { $isStrong = $false; $msg += " - Al menos un numero.`n" }
-    if ($password -notmatch '[\W_]') { $isStrong = $false; $msg += " - Al menos un caracter especial.`n" }
-    if (-not $isStrong) {
-        Write-Host "Contrasena invalida. Debe cumplir:`n$msg" -ForegroundColor Red
+    if ([string]::IsNullOrWhiteSpace($password)) {
+        Write-Host "Error: La contrasena no puede estar vacia." -ForegroundColor Red
         return $false
     }
     return $true
@@ -267,10 +263,12 @@ function configureService {
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.authentication.basicAuthentication.enabled"   -Value $true
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.userIsolation.mode" -Value "IsolateAllDirectories"
 
-    $cert = New-SelfSignedCertificate -DnsName "MiServidorFTP" -CertStoreLocation "cert:\LocalMachine\My"
-    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.serverCertHash"       -Value $cert.Thumbprint
+    # Limpiar certificado previo si existe
+    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.serverCertHash" -Value "" -ErrorAction SilentlyContinue
+    # SSL/TLS desactivado — conexiones en texto plano permitidas
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.controlChannelPolicy" -Value "SslAllow"
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.dataChannelPolicy"    -Value "SslAllow"
+    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.ssl128" -Value $false
 
     if (-not (Get-NetFirewallRule -Name "Regla_FTP_In" -ErrorAction SilentlyContinue)) {
         New-NetFirewallRule -Name "Regla_FTP_In" -DisplayName "Permitir FTP (Puerto 21)" `
