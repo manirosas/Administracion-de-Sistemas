@@ -763,6 +763,74 @@ function consultarGrupos {
 }
 
 # ============================================================
+#  MENU INTERACTIVO (cuando no se pasa -option)
+# ============================================================
+if ([string]::IsNullOrWhiteSpace($option)) {
+    Write-Host "`n╔══════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║       ADMINISTRADOR SERVIDOR FTP     ║" -ForegroundColor Cyan
+    Write-Host "╚══════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  --- Servicio ---" -ForegroundColor Yellow
+    Write-Host "  1)  Verificar servicio FTP"
+    Write-Host "  2)  Instalar servicio FTP"
+    Write-Host "  3)  Configuracion inicial (ejecutar tras instalar)"
+    Write-Host "  4)  Desinstalar servicio FTP"
+    Write-Host "  5)  Estatus del servicio"
+    Write-Host ""
+    Write-Host "  --- Usuarios ---" -ForegroundColor Yellow
+    Write-Host "  6)  Mover usuario a un grupo"
+    Write-Host "  7)  Agregar alumno(s)"
+    Write-Host "  8)  Eliminar alumno"
+    Write-Host "  9)  Consultar alumnos"
+    Write-Host ""
+    Write-Host "  --- Grupos ---" -ForegroundColor Yellow
+    Write-Host "  10) Agregar grupo academico"
+    Write-Host "  11) Eliminar grupo academico"
+    Write-Host "  12) Consultar grupos academicos"
+    Write-Host ""
+    Write-Host "  0)  Salir" -ForegroundColor Red
+    Write-Host ""
+
+    $option = Read-Host "  Selecciona una opcion"
+    $option = $option.Trim()
+
+    # Pedir parametros adicionales segun la opcion elegida
+    switch ($option) {
+        "2" {
+            $install = $true
+        }
+        "4" {
+            $confirm = $true
+        }
+        "6" {
+            $users  = (Read-Host "  Nombre del usuario a mover").Trim()
+            consultarGrupos
+            $groups = (Read-Host "  Nombre del grupo destino").Trim()
+        }
+        "7" {
+            $no_users  = [int](Read-Host "  Cuantos alumnos deseas registrar")
+            $users     = (Read-Host "  Nombres separados por coma (ej: juan,ana)").Trim()
+            $passwords = (Read-Host "  Contrasenas separadas por coma (ej: Pass1!,Pass2!)").Trim()
+        }
+        "8" {
+            consultarAlumnos
+            $users = (Read-Host "  Nombre del alumno a eliminar").Trim()
+        }
+        "10" {
+            $groups = (Read-Host "  Nombre del nuevo grupo academico").Trim()
+        }
+        "11" {
+            consultarGrupos
+            $groups = (Read-Host "  Nombre del grupo a eliminar").Trim()
+        }
+        "0" {
+            Write-Host "`nHasta luego." -ForegroundColor Cyan
+            exit 0
+        }
+    }
+}
+
+# ============================================================
 #  SWITCH PRINCIPAL
 # ============================================================
 switch ($option) {
