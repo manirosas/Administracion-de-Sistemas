@@ -81,139 +81,6 @@ function validateEmpty {
     }
 }
 
-function validateIp {
-    param ([string]$ip, [string]$var, [boolean]$opt)
-    if (($ip -eq "") -and ($opt -eq $true)) { return }
-    if (!($ip -match '^\s*(((10[0-9]|1?[1-9]?[0-9])|(2[0-4][0-9]|25[0-5]))\.){3}(((10[0-9]|1?[1-9]?[0-9])|(2[0-4][0-9]|25[0-5])))\s*$')) {
-        Write-Host "`nNo se ha detectado el formato IPv4, saliendo del programa (variable: '$var')" -ForegroundColor Red
-        exit 1
-    }
-}
-
-function validateInt {
-    param ([string]$num1, [string]$var, [boolean]$opt)
-    if (!($num1 -match '^\d+$')) {
-        Write-Host "`nNo se ha detectado un numero entero sin signos, saliendo del programa (variable: '$var')" -ForegroundColor Red
-        exit 1
-    }
-}
-
-function banIp {
-    param ([string]$ip, [string]$var)
-    $octets = $ip -split "\."
-    if ([int]$octets[0] -eq 0)   { Write-Host "`nEl primer octeto no puede ser 0, saliendo del programa (variable: '$var')"   -ForegroundColor Red; exit 1 }
-    if ([int]$octets[0] -eq 127) { Write-Host "`nEl primer octeto no puede ser 127, saliendo del programa (variable: '$var')" -ForegroundColor Red; exit 1 }
-    if ([int]$octets[0] -eq 255) { Write-Host "`nEl primer octeto no puede ser 255, saliendo del programa (variable: '$var')" -ForegroundColor Red; exit 1 }
-}
-
-function usableIp {
-    param ([string]$ip, [string]$var, [boolean]$opt)
-    if (($ip -eq "") -AND ($opt)) { return $ip }
-    validateIp "$ip" "$var" $opt
-    banIp "$ip" "$var"
-}
-
-function getLocalPrefix {
-    $aux = Get-NetIPAddress -InterfaceIndex 2 | Select-Object PrefixLength | findstr '[0-9]'
-    return $aux.Trim()
-}
-
-function getNetmask {
-    param ([string]$ip)
-    $octet1 = [int]($ip -split "\.")[0]
-    if (($octet1 -ge 1)   -AND ($octet1 -le 126)) { return "255.0.0.0"     }
-    if (($octet1 -ge 128) -AND ($octet1 -le 191)) { return "255.255.0.0"   }
-    if (($octet1 -ge 192) -AND ($octet1 -le 223)) { return "255.255.255.0" }
-}
-
-function getBackwardsSegment {
-    param ([string]$netmask, [string]$ip)
-    $o = $ip -split "\."
-    if ($netmask -eq "255.255.255.0") { return "$($o[0]).$($o[1]).$($o[2])." }
-    if ($netmask -eq "255.255.0.0")   { return "$($o[0]).$($o[1])." }
-    if ($netmask -eq "255.0.0.0")     { return "$($o[0])." }
-    Write-Host "Se ha detectado una mascara invalida" -ForegroundColor Red; exit 1
-}
-
-function getPrefix {
-    param ([string]$ip)
-    $octet1 = [int]($ip -split "\.")[0]
-    if (($octet1 -ge 1)   -AND ($octet1 -le 126)) { return "8"  }
-    if (($octet1 -ge 128) -AND ($octet1 -le 191)) { return "16" }
-    if (($octet1 -ge 192) -AND ($octet1 -le 223)) { return "24" }
-}
-
-function getLocalIp {
-    $aux = Get-NetIPAddress -InterfaceAlias "red_sistemas" -AddressFamily "IPv4" -ErrorAction SilentlyContinue |
-           Select-Object IPAddress | findstr "^[0-9]"
-    if (!($aux -match '^\s*(((10[0-9])|(1?[1-9]?[0-9])|(2[0-4][0-9])|(25[0-5]))\.){3}((10[0-9])|(1?[1-9]?[0-9])|(2[0-4][0-9])|(25[0-5]))\s*$')) {
-        Write-Host "`nNo se ha detectado una IPv4 local valida" -ForegroundColor Red
-        return "0"
-    }
-    return $aux
-}
-
-function getSegment {
-    param ([string]$ip)
-    $o = $ip -split "\."
-    $octet1 = [int]$o[0]
-    if (($octet1 -ge 1)   -AND ($octet1 -le 126)) { return "$($o[0]).0.0.0"              }
-    if (($octet1 -ge 128) -AND ($octet1 -le 191)) { return "$($o[0]).$($o[1]).0.0"       }
-    if (($octet1 -ge 192) -AND ($octet1 -le 223)) { return "$($o[0]).$($o[1]).$($o[2]).0" }
-}
-
-function validateTimeFormat {
-    param ([string]$var, [string]$text)
-    $var = $var.Trim()
-    if (!($var -match '^(\d+\.)?([0-1]?[0-9]|2[0-3]):[0-5]?[0-9](:[0-5]?[0-9])?$')) {
-        Write-Host "`nNo se ha detectado un tiempo correcto, formatos validos: (D.)?HH:MM:SS | H:M:S | HH:MM | H:M (variable: $text)" -ForegroundColor Red
-        exit 1
-    }
-}
-
-function restartIp {
-    param ([string]$ip)
-    $prefix = getPrefix $ip
-    Remove-NetIPAddress -InterfaceIndex 2 -Confirm:$false
-    New-NetIPAddress -InterfaceIndex 2 -IPAddress $ip -PrefixLength $prefix -Confirm:$false > $null 2>&1
-}
-
-function validateSegment1 {
-    param ([string]$seg1, [string]$seg2, [string]$text)
-    if ($seg1 -ne $seg2) { Write-Host $text -ForegroundColor Red; return $false }
-    return $true
-}
-
-function getOne {
-    param ([string]$ip)
-    $o = $ip -split "\."
-    $o1=[int]$o[0]; $o2=[int]$o[1]; $o3=[int]$o[2]; $o4=[int]$o[3]
-    $o4++
-    if ($o4 -ge 256) { $o3++; $o4=0 }
-    if ($o3 -ge 256) { $o2++; $o3=0 }
-    if ($o2 -ge 256) { $o1++; $o2=0 }
-    return "$o1.$o2.$o3.$o4"
-}
-
-function ConvertTo-IPv4Integer {
-    param ([string]$IPv4Address)
-    $bytes = ([IPAddress]::Parse($IPv4Address)).GetAddressBytes()
-    [Array]::Reverse($bytes)
-    return [System.BitConverter]::ToUInt32($bytes, 0)
-}
-
-function CompareIp {
-    param ([string]$ip1, [string]$ip2)
-    return ((ConvertTo-IPv4Integer $ip1) -gt (ConvertTo-IPv4Integer $ip2))
-}
-
-function verificarAdmin {
-    $resul = (whoami) -split "\\"
-    if ($resul[1] -ne "administrator") {
-        Write-Host "Se ha detectado que no se ha iniciado con la cuenta administrator" -ForegroundColor Red
-        exit 1
-    }
-}
 
 function validateEmptyArray {
     param ([array]$array)
@@ -225,15 +92,6 @@ function validateEmptyArray {
     }
 }
 
-function validateGroupNumber {
-    param ([array]$array)
-    foreach ($element in $array) {
-        if (($element -ne "1") -AND ($element -ne "2")) {
-            Write-Host "Se ha detectado un grupo que no es ni 1 ni 2" -ForegroundColor Red
-            exit 1
-        }
-    }
-}
 
 function UserExist {
     param ([string]$nombre)
@@ -279,14 +137,6 @@ function validatePassword {
     return $true
 }
 
-function validateUsernameArray {
-    param ([array]$array)
-    foreach ($element in $array) {
-        if (-not (validateUserName -userName $element)) { exit 1 }
-    }
-}
-
-function crearGrupo {
     param ([string]$nombreGrupo, [string]$descripcion)
     $nombreGrupo = $nombreGrupo.Trim()
 
@@ -314,6 +164,31 @@ function crearGrupo {
 # ============================================================
 #  FUNCION AUXILIAR DE PERMISOS NTFS
 # ============================================================
+function crearGrupo {
+    param ([string]$nombreGrupo, [string]$descripcion)
+    $nombreGrupo = $nombreGrupo.Trim()
+
+    if ($script:gruposSistema -contains $nombreGrupo) {
+        Write-Host "Error: No puedes crear el grupo '$nombreGrupo' porque es un grupo reservado del sistema." -ForegroundColor Red
+        return $false
+    }
+    if ($null -ne (Get-LocalGroup -Name $nombreGrupo -ErrorAction SilentlyContinue)) {
+        Write-Host "Aviso: El grupo '$nombreGrupo' ya existe en el servidor." -ForegroundColor Yellow
+        return $false
+    }
+
+    New-LocalGroup -Name $nombreGrupo -Description $descripcion | Out-Null
+
+    $rutaDirectorio = "C:\FTP\$nombreGrupo"
+    if (-not (Test-Path $rutaDirectorio)) { New-Item -Path $rutaDirectorio -ItemType Directory -Force | Out-Null }
+
+    icacls $rutaDirectorio /inheritance:r /grant "Administrators:(OI)(CI)F" /grant "SYSTEM:(OI)(CI)F" /grant "${nombreGrupo}:(OI)(CI)M" /grant "Authenticated Users:(OI)(CI)M" /T /C /Q > $null 2>&1
+    icacls $rutaDirectorio /deny "IUSR:(OI)(CI)F" /T /C /Q > $null 2>&1
+
+    Write-Host "El grupo '$nombreGrupo' y su carpeta han sido creados correctamente!" -ForegroundColor Green
+    return $true
+}
+
 function Set-NtfsRule {
     param(
         [string]$Path,
@@ -596,7 +471,7 @@ function crearAlumno {
         if (-not (Test-Path $RutaUsuario)) { New-Item -Path $RutaUsuario -ItemType Directory -Force | Out-Null }
 
         # Resetear herencia en todo el arbol
-        @($RutaUsuario) + (Get-ChildItem $RutaUsuario -Recurse -Force -ErrorAction SilentlyContinue).FullName |
+        @($RutaUsuario) + @((Get-ChildItem $RutaUsuario -Recurse -Force -ErrorAction SilentlyContinue).FullName) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
         ForEach-Object {
             $r = $_
             $a = Get-Acl $r
