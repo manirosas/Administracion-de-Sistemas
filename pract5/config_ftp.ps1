@@ -137,32 +137,8 @@ function validatePassword {
     return $true
 }
 
-    param ([string]$nombreGrupo, [string]$descripcion)
-    $nombreGrupo = $nombreGrupo.Trim()
-
-    if ($script:gruposSistema -contains $nombreGrupo) {
-        Write-Host "Error: No puedes crear el grupo '$nombreGrupo' porque es un grupo reservado del sistema." -ForegroundColor Red
-        return $false
-    }
-    if ($null -ne (Get-LocalGroup -Name $nombreGrupo -ErrorAction SilentlyContinue)) {
-        Write-Host "Aviso: El grupo '$nombreGrupo' ya existe en el servidor." -ForegroundColor Yellow
-        return $false
-    }
-
-    New-LocalGroup -Name $nombreGrupo -Description $descripcion | Out-Null
-
-    $rutaDirectorio = "C:\FTP\$nombreGrupo"
-    if (-not (Test-Path $rutaDirectorio)) { New-Item -Path $rutaDirectorio -ItemType Directory -Force | Out-Null }
-
-    icacls $rutaDirectorio /inheritance:r /grant "Administrators:(OI)(CI)F" /grant "SYSTEM:(OI)(CI)F" /grant "${nombreGrupo}:(OI)(CI)M" /grant "Authenticated Users:(OI)(CI)M" /T /C /Q > $null 2>&1
-    icacls $rutaDirectorio /deny "IUSR:(OI)(CI)F" /T /C /Q > $null 2>&1
-
-    Write-Host "El grupo '$nombreGrupo' y su carpeta han sido creados correctamente!" -ForegroundColor Green
-    return $true
-}
-
 # ============================================================
-#  FUNCION AUXILIAR DE PERMISOS NTFS
+# OPCION 10 — Crear grupo academico
 # ============================================================
 function crearGrupo {
     param ([string]$nombreGrupo, [string]$descripcion)
