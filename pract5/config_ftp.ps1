@@ -13,14 +13,23 @@ param (
 #  VECTORES DE SEGURIDAD GLOBALES
 # ============================================================
 $script:gruposSistema = @(
-    "Administrators","Users","Guests","Power Users","Remote Desktop Users",
-    "IIS_IUSRS","Performance Monitor Users","Performance Log Users",
-    "Distributed COM Users","Cryptographic Operators","Backup Operators",
-    "Network Configuration Operators","Event Log Readers","Certificate Service DCOM Access"
+    "Access Control Assistance Operators", "Administrators", "Backup Operators",
+    "Certificate Service DCOM Access", "Cryptographic Operators", "Device Owners",
+    "Distributed COM Users", "Event Log Readers", "Guests", "Hyper-V Administrators",
+    "IIS_IUSRS", "Network Configuration Operators", "Performance Log Users",
+    "Performance Monitor Users", "Power Users", "Print Operators", "RDS Endpoint Servers",
+    "RDS Management Servers", "RDS Remote Access Servers", "Remote Desktop Users",
+    "Remote Management Users", "Replicator", "Storage Replica Administrators",
+    "System Managed Accounts Group", "Users"
 )
 
 $script:usuariosSistema = @(
-    "Administrator","Guest","DefaultAccount","WDAGUtilityAccount","SYSTEM","IUSR"
+    "Administrator",
+    "Guest",
+    "DefaultAccount",
+    "WDAGUtilityAccount",
+    "IUSR",
+    "utilityaccount"
 )
 
 # ============================================================
@@ -49,7 +58,7 @@ $helpM += "-install    Confirmar instalacion`n"
 $helpM += "-no_users   Numero de usuarios a registrar`n"
 $helpM += "-users      Lista de usuarios separados por coma  |  nombre de usuario para cambio de grupo`n"
 $helpM += "-passwords  Lista de contrasenas separadas por coma`n"
-$helpM += "-groups     Grupo destino (para opcion 6, 10, 11) o lista separada por coma`n`n"
+$helpM += "-groups     Grupo destino (opcion 6, 10, 11)`n`n"
 $helpM += "Ejemplos:`n"
 $helpM += "  .\ftp_manager.ps1 -option 7 -no_users 2 -users 'juan,ana' -passwords 'Pass1!,Pass2!'`n"
 $helpM += "  .\ftp_manager.ps1 -option 6 -users 'juan' -groups 'Recursadores'`n"
@@ -60,91 +69,246 @@ if ($help) { Write-Host $helpM; exit 0 }
 $color = "Yellow"
 
 # ============================================================
-#  FUNCIONES AUXILIARES (reemplazo de power_fun_par.ps1)
+#  FUNCIONES DE VALIDACION (power_fun_par.ps1 — integradas)
 # ============================================================
 
-# Verifica si un string esta vacio o nulo
 function validateEmpty {
-    param([string]$valor, [string]$nombreCampo = "El campo")
-    if ([string]::IsNullOrWhiteSpace($valor)) {
-        Write-Host "Error: $nombreCampo no puede estar vacio." -ForegroundColor Red
+    param ([string]$value, [string]$var)
+    $value = $value.Trim()
+    if ($value -eq "") {
+        Write-Host "`nSe ha detectado un espacio vacio, saliendo del programa (variable: '$var')" -ForegroundColor Red
         exit 1
     }
 }
 
-# Verifica que todos los elementos de un array no sean vacios
+function validateIp {
+    param ([string]$ip, [string]$var, [boolean]$opt)
+    if (($ip -eq "") -and ($opt -eq $true)) { return }
+    if (!($ip -match '^\s*(((10[0-9]|1?[1-9]?[0-9])|(2[0-4][0-9]|25[0-5]))\.){3}(((10[0-9]|1?[1-9]?[0-9])|(2[0-4][0-9]|25[0-5])))\s*$')) {
+        Write-Host "`nNo se ha detectado el formato IPv4, saliendo del programa (variable: '$var')" -ForegroundColor Red
+        exit 1
+    }
+}
+
+function validateInt {
+    param ([string]$num1, [string]$var, [boolean]$opt)
+    if (!($num1 -match '^\d+$')) {
+        Write-Host "`nNo se ha detectado un numero entero sin signos, saliendo del programa (variable: '$var')" -ForegroundColor Red
+        exit 1
+    }
+}
+
+function banIp {
+    param ([string]$ip, [string]$var)
+    $octets = $ip -split "\."
+    if ([int]$octets[0] -eq 0)   { Write-Host "`nEl primer octeto no puede ser 0, saliendo del programa (variable: '$var')"   -ForegroundColor Red; exit 1 }
+    if ([int]$octets[0] -eq 127) { Write-Host "`nEl primer octeto no puede ser 127, saliendo del programa (variable: '$var')" -ForegroundColor Red; exit 1 }
+    if ([int]$octets[0] -eq 255) { Write-Host "`nEl primer octeto no puede ser 255, saliendo del programa (variable: '$var')" -ForegroundColor Red; exit 1 }
+}
+
+function usableIp {
+    param ([string]$ip, [string]$var, [boolean]$opt)
+    if (($ip -eq "") -AND ($opt)) { return $ip }
+    validateIp "$ip" "$var" $opt
+    banIp "$ip" "$var"
+}
+
+function getLocalPrefix {
+    $aux = Get-NetIPAddress -InterfaceIndex 2 | Select-Object PrefixLength | findstr '[0-9]'
+    return $aux.Trim()
+}
+
+function getNetmask {
+    param ([string]$ip)
+    $octet1 = [int]($ip -split "\.")[0]
+    if (($octet1 -ge 1)   -AND ($octet1 -le 126)) { return "255.0.0.0"     }
+    if (($octet1 -ge 128) -AND ($octet1 -le 191)) { return "255.255.0.0"   }
+    if (($octet1 -ge 192) -AND ($octet1 -le 223)) { return "255.255.255.0" }
+}
+
+function getBackwardsSegment {
+    param ([string]$netmask, [string]$ip)
+    $o = $ip -split "\."
+    if ($netmask -eq "255.255.255.0") { return "$($o[0]).$($o[1]).$($o[2])." }
+    if ($netmask -eq "255.255.0.0")   { return "$($o[0]).$($o[1])." }
+    if ($netmask -eq "255.0.0.0")     { return "$($o[0])." }
+    Write-Host "Se ha detectado una mascara invalida" -ForegroundColor Red; exit 1
+}
+
+function getPrefix {
+    param ([string]$ip)
+    $octet1 = [int]($ip -split "\.")[0]
+    if (($octet1 -ge 1)   -AND ($octet1 -le 126)) { return "8"  }
+    if (($octet1 -ge 128) -AND ($octet1 -le 191)) { return "16" }
+    if (($octet1 -ge 192) -AND ($octet1 -le 223)) { return "24" }
+}
+
+function getLocalIp {
+    $aux = Get-NetIPAddress -InterfaceAlias "red_sistemas" -AddressFamily "IPv4" -ErrorAction SilentlyContinue |
+           Select-Object IPAddress | findstr "^[0-9]"
+    if (!($aux -match '^\s*(((10[0-9])|(1?[1-9]?[0-9])|(2[0-4][0-9])|(25[0-5]))\.){3}((10[0-9])|(1?[1-9]?[0-9])|(2[0-4][0-9])|(25[0-5]))\s*$')) {
+        Write-Host "`nNo se ha detectado una IPv4 local valida" -ForegroundColor Red
+        return "0"
+    }
+    return $aux
+}
+
+function getSegment {
+    param ([string]$ip)
+    $o = $ip -split "\."
+    $octet1 = [int]$o[0]
+    if (($octet1 -ge 1)   -AND ($octet1 -le 126)) { return "$($o[0]).0.0.0"              }
+    if (($octet1 -ge 128) -AND ($octet1 -le 191)) { return "$($o[0]).$($o[1]).0.0"       }
+    if (($octet1 -ge 192) -AND ($octet1 -le 223)) { return "$($o[0]).$($o[1]).$($o[2]).0" }
+}
+
+function validateTimeFormat {
+    param ([string]$var, [string]$text)
+    $var = $var.Trim()
+    if (!($var -match '^(\d+\.)?([0-1]?[0-9]|2[0-3]):[0-5]?[0-9](:[0-5]?[0-9])?$')) {
+        Write-Host "`nNo se ha detectado un tiempo correcto, formatos validos: (D.)?HH:MM:SS | H:M:S | HH:MM | H:M (variable: $text)" -ForegroundColor Red
+        exit 1
+    }
+}
+
+function restartIp {
+    param ([string]$ip)
+    $prefix = getPrefix $ip
+    Remove-NetIPAddress -InterfaceIndex 2 -Confirm:$false
+    New-NetIPAddress -InterfaceIndex 2 -IPAddress $ip -PrefixLength $prefix -Confirm:$false > $null 2>&1
+}
+
+function validateSegment1 {
+    param ([string]$seg1, [string]$seg2, [string]$text)
+    if ($seg1 -ne $seg2) { Write-Host $text -ForegroundColor Red; return $false }
+    return $true
+}
+
+function getOne {
+    param ([string]$ip)
+    $o = $ip -split "\."
+    $o1=[int]$o[0]; $o2=[int]$o[1]; $o3=[int]$o[2]; $o4=[int]$o[3]
+    $o4++
+    if ($o4 -ge 256) { $o3++; $o4=0 }
+    if ($o3 -ge 256) { $o2++; $o3=0 }
+    if ($o2 -ge 256) { $o1++; $o2=0 }
+    return "$o1.$o2.$o3.$o4"
+}
+
+function ConvertTo-IPv4Integer {
+    param ([string]$IPv4Address)
+    $bytes = ([IPAddress]::Parse($IPv4Address)).GetAddressBytes()
+    [Array]::Reverse($bytes)
+    return [System.BitConverter]::ToUInt32($bytes, 0)
+}
+
+function CompareIp {
+    param ([string]$ip1, [string]$ip2)
+    return ((ConvertTo-IPv4Integer $ip1) -gt (ConvertTo-IPv4Integer $ip2))
+}
+
+function verificarAdmin {
+    $resul = (whoami) -split "\\"
+    if ($resul[1] -ne "administrator") {
+        Write-Host "Se ha detectado que no se ha iniciado con la cuenta administrator" -ForegroundColor Red
+        exit 1
+    }
+}
+
 function validateEmptyArray {
-    param([array]$arr)
-    foreach ($item in $arr) {
-        if ([string]::IsNullOrWhiteSpace($item)) {
-            Write-Host "Error: Se encontro un valor vacio en la lista." -ForegroundColor Red
+    param ([array]$array)
+    foreach ($element in $array) {
+        if ($element.Trim() -eq "") {
+            Write-Host "Se ha detectado un valor vacio en el arreglo" -ForegroundColor Red
             exit 1
         }
     }
 }
 
-# Valida que el nombre de usuario cumpla reglas basicas de Windows
-function validateUserName {
-    param([string]$nombre)
-    if ($nombre.Length -lt 1 -or $nombre.Length -gt 20) {
-        Write-Host "Error: El nombre '$nombre' debe tener entre 1 y 20 caracteres." -ForegroundColor Red
-        return $false
+function validateGroupNumber {
+    param ([array]$array)
+    foreach ($element in $array) {
+        if (($element -ne "1") -AND ($element -ne "2")) {
+            Write-Host "Se ha detectado un grupo que no es ni 1 ni 2" -ForegroundColor Red
+            exit 1
+        }
     }
-    # Caracteres prohibidos en nombres de usuario Windows
-    $invalidos = '["/\\\[\]:;|=,+*?<>@]'
-    if ($nombre -match $invalidos) {
-        Write-Host "Error: El nombre '$nombre' contiene caracteres no permitidos." -ForegroundColor Red
-        return $false
-    }
-    if ($script:usuariosSistema -contains $nombre) {
-        Write-Host "Error: '$nombre' es un usuario reservado del sistema." -ForegroundColor Red
-        return $false
-    }
-    return $true
 }
 
-# Valida que la contrasena cumpla politica minima
-function validatePassword {
-    param([string]$pass)
-    if ($pass.Length -lt 8) {
-        Write-Host "Error: La contrasena debe tener al menos 8 caracteres." -ForegroundColor Red
-        return $false
-    }
-    if ($pass -notmatch '[A-Z]') {
-        Write-Host "Error: La contrasena debe contener al menos una letra mayuscula." -ForegroundColor Red
-        return $false
-    }
-    if ($pass -notmatch '[a-z]') {
-        Write-Host "Error: La contrasena debe contener al menos una letra minuscula." -ForegroundColor Red
-        return $false
-    }
-    if ($pass -notmatch '[0-9]') {
-        Write-Host "Error: La contrasena debe contener al menos un numero." -ForegroundColor Red
-        return $false
-    }
-    if ($pass -notmatch '[^a-zA-Z0-9]') {
-        Write-Host "Error: La contrasena debe contener al menos un caracter especial (!@#$%...)." -ForegroundColor Red
-        return $false
-    }
-    return $true
-}
-
-# Verifica si un usuario local existe
 function UserExist {
-    param([string]$nombre)
+    param ([string]$nombre)
+    $nombre = $nombre.Trim()
     return ($null -ne (Get-LocalUser -Name $nombre -ErrorAction SilentlyContinue))
 }
 
-# Verifica que los usuarios del array NO existan ya (para creacion)
 function validateUserCreated {
-    param([array]$arr)
-    foreach ($u in $arr) {
-        $u = $u.Trim()
-        if (UserExist -nombre $u) {
-            Write-Host "Error: El usuario '$u' ya existe en el sistema." -ForegroundColor Red
+    param ([array]$array)
+    foreach ($element in $array) {
+        $element = $element.Trim()
+        if (UserExist $element) {
+            Write-Host "Se ha encontrado que el usuario '$element' ya ha sido creado" -ForegroundColor Red
             exit 1
         }
     }
+}
+
+function validateUserName {
+    param ([string]$userName)
+    if ($userName.Length -lt 3 -or $userName.Length -gt 20) {
+        Write-Host "Error: El usuario '$userName' debe tener entre 3 y 20 caracteres." -ForegroundColor Red
+        return $false
+    }
+    if ($userName -match '[\\/\[\]:;|=,+*?<>]') {
+        Write-Host "Error: El usuario '$userName' contiene caracteres no permitidos." -ForegroundColor Red
+        return $false
+    }
+    return $true
+}
+
+function validatePassword {
+    param ([string]$password)
+    $isStrong = $true; $msg = ""
+    if ($password.Length -lt 8)     { $isStrong = $false; $msg += " - Minimo 8 caracteres.`n" }
+    if ($password -notmatch '[A-Z]') { $isStrong = $false; $msg += " - Al menos una mayuscula.`n" }
+    if ($password -notmatch '[0-9]') { $isStrong = $false; $msg += " - Al menos un numero.`n" }
+    if ($password -notmatch '[\W_]') { $isStrong = $false; $msg += " - Al menos un caracter especial.`n" }
+    if (-not $isStrong) {
+        Write-Host "Contrasena invalida. Debe cumplir:`n$msg" -ForegroundColor Red
+        return $false
+    }
+    return $true
+}
+
+function validateUsernameArray {
+    param ([array]$array)
+    foreach ($element in $array) {
+        if (-not (validateUserName -userName $element)) { exit 1 }
+    }
+}
+
+function crearGrupo {
+    param ([string]$nombreGrupo, [string]$descripcion)
+    $nombreGrupo = $nombreGrupo.Trim()
+
+    if ($script:gruposSistema -contains $nombreGrupo) {
+        Write-Host "Error: No puedes crear el grupo '$nombreGrupo' porque es un grupo reservado del sistema." -ForegroundColor Red
+        return $false
+    }
+    if ($null -ne (Get-LocalGroup -Name $nombreGrupo -ErrorAction SilentlyContinue)) {
+        Write-Host "Aviso: El grupo '$nombreGrupo' ya existe en el servidor." -ForegroundColor Yellow
+        return $false
+    }
+
+    New-LocalGroup -Name $nombreGrupo -Description $descripcion | Out-Null
+
+    $rutaDirectorio = "C:\FTP\$nombreGrupo"
+    if (-not (Test-Path $rutaDirectorio)) { New-Item -Path $rutaDirectorio -ItemType Directory -Force | Out-Null }
+
+    icacls $rutaDirectorio /inheritance:r /grant "Administrators:(OI)(CI)F" /grant "SYSTEM:(OI)(CI)F" /grant "${nombreGrupo}:(OI)(CI)M" /grant "Authenticated Users:(OI)(CI)M" /T /C /Q > $null 2>&1
+    icacls $rutaDirectorio /deny "IUSR:(OI)(CI)F" /T /C /Q > $null 2>&1
+
+    Write-Host "El grupo '$nombreGrupo' y su carpeta han sido creados correctamente!" -ForegroundColor Green
+    return $true
 }
 
 # ============================================================
@@ -173,9 +337,9 @@ function Set-NtfsRule {
 function checkService {
     $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
     if ($null -eq $svc) {
-        Write-Host "El servicio FTPSVC NO esta instalado." -ForegroundColor Red
+        Write-Host "Se ha detectado que no se tiene instalado el servicio FTPSVC" -ForegroundColor Red
     } else {
-        Write-Host "El servicio FTPSVC esta instalado. Estado: $($svc.Status)" -ForegroundColor $color
+        Write-Host "Se ha detectado el servicio FTPSVC instalado. Estado: $($svc.Status)" -ForegroundColor $color
     }
 }
 
@@ -185,16 +349,16 @@ function checkService {
 function installService {
     $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
     if ($null -ne $svc) {
-        Write-Host "El servicio FTPSVC ya esta instalado." -ForegroundColor $color
+        Write-Host "Se ha detectado el servicio FTPSVC instalado" -ForegroundColor $color
         return
     }
-    Write-Host "El servicio FTPSVC no esta instalado." -ForegroundColor Red
+    Write-Host "Se ha detectado que no se tiene instalado el FTPSVC Server" -ForegroundColor Red
     if ($install) {
         Write-Host "Iniciando instalacion..." -ForegroundColor $color
         Install-WindowsFeature -Name Web-Server, Web-FTP-Server, Web-FTP-Ext -IncludeManagementTools
-        Write-Host "Instalacion completada correctamente." -ForegroundColor Green
+        Write-Host "La instalacion ha finalizado correctamente" -ForegroundColor Green
     } else {
-        Write-Host "Usa la bandera -install para confirmar la instalacion." -ForegroundColor $color
+        Write-Host "Use la bandera -install para activar la instalacion" -ForegroundColor $color
     }
 }
 
@@ -217,23 +381,19 @@ function configureService {
     $PublicJailPath = "$RutaLocalUser\Public"
     $PublicJunction = "$PublicJailPath\Publica"
 
-    Write-Host "Creando estructura de directorios..." -ForegroundColor Cyan
+    Write-Host "Preparando estructura de directorios..." -ForegroundColor Cyan
 
     foreach ($dir in @($Ruta, $RutaLocalUser, $CarpetaPublica, $CarpetaRepro, $CarpetaRecurs, $PublicJailPath)) {
         if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
     }
-
-    # Junction para usuario anonimo
     if (-not (Test-Path $PublicJunction)) {
         New-Item -ItemType Junction -Path $PublicJunction -Target $CarpetaPublica -Force | Out-Null
     }
 
-    # Limpiar configuracion previa
     icacls $Ruta /reset /T /C /Q > $null 2>&1
     if (Test-Path "$Ruta\web.config") { Remove-Item "$Ruta\web.config" -Force -ErrorAction SilentlyContinue }
 
-    Write-Host "Creando grupos del sistema..." -ForegroundColor Cyan
-
+    Write-Host "Creando grupos base del sistema..." -ForegroundColor Cyan
     $gruposBase = @(
         @{Name="Alumnos";      Desc="Identificador Alumnos"},
         @{Name="Reprobados";   Desc="Grupo Academico"},
@@ -250,21 +410,17 @@ function configureService {
 
     Write-Host "Configurando IIS / FTP..." -ForegroundColor Cyan
     Import-Module WebAdministration -ErrorAction Stop
-
     New-WebFtpSite -Name $Name -Port 21 -PhysicalPath $Ruta -Force | Out-Null
 
-    # Autenticacion
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.authentication.anonymousAuthentication.enabled" -Value $true
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.authentication.basicAuthentication.enabled"   -Value $true
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.userIsolation.mode" -Value "IsolateAllDirectories"
 
-    # SSL auto-firmado
     $cert = New-SelfSignedCertificate -DnsName "MiServidorFTP" -CertStoreLocation "cert:\LocalMachine\My"
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.serverCertHash"       -Value $cert.Thumbprint
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.controlChannelPolicy" -Value "SslRequire"
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.dataChannelPolicy"    -Value "SslRequire"
 
-    # Firewall
     if (-not (Get-NetFirewallRule -Name "Regla_FTP_In" -ErrorAction SilentlyContinue)) {
         New-NetFirewallRule -Name "Regla_FTP_In" -DisplayName "Permitir FTP (Puerto 21)" `
             -Direction Inbound -Protocol TCP -LocalPort 21 -Action Allow | Out-Null
@@ -279,7 +435,6 @@ function configureService {
 
     Write-Host "Aplicando permisos NTFS..." -ForegroundColor Cyan
 
-    # Raiz C:\FTP
     $acl = Get-Acl $Ruta; $acl.SetAccessRuleProtection($true,$false); Set-Acl $Ruta $acl
     Set-NtfsRule $Ruta "Administrators"      "FullControl"
     Set-NtfsRule $Ruta "SYSTEM"              "FullControl"
@@ -287,22 +442,17 @@ function configureService {
     Set-NtfsRule $Ruta "IUSR"               "ReadAndExecute"
     Set-NtfsRule $Ruta "Authenticated Users" "ReadAndExecute"
 
-    # LocalUser
     Set-NtfsRule $RutaLocalUser "Authenticated Users" "ReadAndExecute"
     Set-NtfsRule $RutaLocalUser "IUSR"               "ReadAndExecute"
-
-    # Jaula anonima
     Set-NtfsRule $PublicJailPath "IUSR" "ReadAndExecute"
     Set-NtfsRule $PublicJunction "IUSR" "ReadAndExecute"
 
-    # Carpeta Publica (todos leen, autenticados modifican)
     $acl = Get-Acl $CarpetaPublica; $acl.SetAccessRuleProtection($true,$false); Set-Acl $CarpetaPublica $acl
     Set-NtfsRule $CarpetaPublica "Administrators"      "FullControl"
     Set-NtfsRule $CarpetaPublica "SYSTEM"              "FullControl"
     Set-NtfsRule $CarpetaPublica "IUSR"               "ReadAndExecute"
     Set-NtfsRule $CarpetaPublica "Authenticated Users" "Modify"
 
-    # Carpeta Reprobados
     $acl = Get-Acl $CarpetaRepro; $acl.SetAccessRuleProtection($true,$false); Set-Acl $CarpetaRepro $acl
     Set-NtfsRule $CarpetaRepro "Administrators" "FullControl"
     Set-NtfsRule $CarpetaRepro "SYSTEM"         "FullControl"
@@ -310,7 +460,6 @@ function configureService {
     Set-NtfsRule $CarpetaRepro "Recursadores"   "FullControl" "ContainerInherit,ObjectInherit" "None" "Deny"
     Set-NtfsRule $CarpetaRepro "IUSR"           "FullControl" "ContainerInherit,ObjectInherit" "None" "Deny"
 
-    # Carpeta Recursadores
     $acl = Get-Acl $CarpetaRecurs; $acl.SetAccessRuleProtection($true,$false); Set-Acl $CarpetaRecurs $acl
     Set-NtfsRule $CarpetaRecurs "Administrators" "FullControl"
     Set-NtfsRule $CarpetaRecurs "SYSTEM"         "FullControl"
@@ -319,7 +468,7 @@ function configureService {
     Set-NtfsRule $CarpetaRecurs "IUSR"           "FullControl" "ContainerInherit,ObjectInherit" "None" "Deny"
 
     Restart-WebItem "IIS:\Sites\$Name"
-    Write-Host "Configuracion inicial completada con exito." -ForegroundColor Green
+    Write-Host "Configuracion completada con exito." -ForegroundColor Green
 }
 
 # ============================================================
@@ -328,16 +477,16 @@ function configureService {
 function uninstallService {
     $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
     if ($null -eq $svc) {
-        Write-Host "El servicio FTPSVC no esta instalado." -ForegroundColor Red
+        Write-Host "Se ha detectado que no se tiene instalado el servicio FTPSVC" -ForegroundColor Red
         return
     }
-    Write-Host "El servicio FTPSVC esta instalado." -ForegroundColor $color
+    Write-Host "Se ha detectado el servicio FTPSVC instalado" -ForegroundColor $color
     if ($confirm) {
-        Write-Host "Desinstalando..." -ForegroundColor $color
+        Write-Host "Iniciando desinstalacion..." -ForegroundColor $color
         Uninstall-WindowsFeature -Name Web-FTP-Server, Web-FTP-Ext
-        Write-Host "Desinstalacion completada." -ForegroundColor Red
+        Write-Host "La desinstalacion ha finalizado correctamente" -ForegroundColor Red
     } else {
-        Write-Host "Usa la bandera -confirm para confirmar la desinstalacion." -ForegroundColor $color
+        Write-Host "Use la bandera -confirm para confirmar la desinstalacion" -ForegroundColor $color
     }
 }
 
@@ -347,73 +496,61 @@ function uninstallService {
 function monitoreo {
     $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
     if ($null -eq $svc) {
-        Write-Host "El servicio FTPSVC no esta instalado." -ForegroundColor Red
+        Write-Host "Se ha detectado que no se tiene instalado el servicio FTPSVC" -ForegroundColor Red
         return
     }
-    Write-Host "`n=== Estado del servicio FTPSVC ===" -ForegroundColor $color
+    Write-Host "`n=== Estado del servicio ===" -ForegroundColor $color
     Get-Service -Name "FTPSVC" | Format-Table -AutoSize
-
-    Write-Host "=== Sitios FTP en IIS ===" -ForegroundColor $color
-    Import-Module WebAdministration -ErrorAction SilentlyContinue
-    Get-WebSite | Where-Object { $_.serverAutoStart -ne $null } | Format-Table Name, State, PhysicalPath -AutoSize
 }
 
 # ============================================================
 #  OPCION 6 — Cambiar usuario de grupo
 # ============================================================
 function changeGroup {
-    param(
-        [string]$usuario,
-        [string]$grupoDestino
-    )
+    param ([string]$usuario, [string]$grupoDestino)
 
     $usuario      = $usuario.Trim()
     $grupoDestino = $grupoDestino.Trim()
     $Ruta         = "C:\FTP"
     $RutaUsuario  = "$Ruta\LocalUser\$usuario"
 
-    validateEmpty $usuario      "El parametro -users (usuario)"
-    validateEmpty $grupoDestino "El parametro -groups (grupo destino)"
+    validateEmpty $usuario      "users"
+    validateEmpty $grupoDestino "groups"
 
     if (-not (UserExist $usuario)) {
-        Write-Host "Error: El usuario '$usuario' no existe." -ForegroundColor Red
+        Write-Host "Error: El usuario '$usuario' no existe en el sistema." -ForegroundColor Red
         return
     }
     if (-not (Get-LocalGroup -Name $grupoDestino -ErrorAction SilentlyContinue)) {
-        Write-Host "Error: El grupo '$grupoDestino' no existe." -ForegroundColor Red
+        Write-Host "Error: El grupo academico '$grupoDestino' no existe." -ForegroundColor Red
         return
     }
     if ($script:gruposSistema -contains $grupoDestino) {
-        Write-Host "Error de seguridad: No puedes mover alumnos a grupos del sistema." -ForegroundColor Red
+        Write-Host "Error de seguridad: No puedes mover alumnos a grupos del sistema ($grupoDestino)." -ForegroundColor Red
         return
     }
 
-    # Quitar de grupos academicos anteriores
     $gruposActuales = Get-LocalGroup | Where-Object {
         ($_.Name -notin $script:gruposSistema) -and ($_.Name -ne "Alumnos") -and
         ((Get-LocalGroupMember -Group $_.Name -ErrorAction SilentlyContinue).Name -match $usuario)
     }
-
     foreach ($grupoViejo in $gruposActuales) {
         Remove-LocalGroupMember -Group $grupoViejo.Name -Member $usuario -ErrorAction SilentlyContinue
         $rutaTunel = "$RutaUsuario\$($grupoViejo.Name)"
         if (Test-Path $rutaTunel) { Remove-Item -Path $rutaTunel -Recurse -Force -Confirm:$false | Out-Null }
     }
 
-    # Asignar nuevo grupo
     Add-LocalGroupMember -Group $grupoDestino -Member $usuario -ErrorAction SilentlyContinue
 
-    # Crear junction al nuevo grupo
     $rutaNuevaTunel = "$RutaUsuario\$grupoDestino"
     if (-not (Test-Path $rutaNuevaTunel)) {
         New-Item -ItemType Junction -Path $rutaNuevaTunel -Target "$Ruta\$grupoDestino" -Force | Out-Null
     }
 
-    # Reiniciar FTP para aplicar cambios
     $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
     if ($null -ne $svc) { Restart-Service ftpsvc }
 
-    Write-Host "Usuario '$usuario' movido al grupo '$grupoDestino' correctamente." -ForegroundColor Green
+    Write-Host "Se ha cambiado al usuario '$usuario' al grupo '$grupoDestino' con exito" -ForegroundColor Green
 }
 
 # ============================================================
@@ -427,13 +564,14 @@ function crearAlumno {
     $arrPasswd = $passwords -split ","
 
     if ($arrUsers.Length -ne $no_users -or $arrPasswd.Length -ne $no_users) {
-        Write-Host "Error: El numero de usuarios y contrasenas debe coincidir con -no_users ($no_users)." -ForegroundColor Red
+        Write-Host "El numero de usuarios y contrasenas debe coincidir con -no_users ($no_users)." -ForegroundColor Red
         exit 1
     }
 
     validateEmptyArray $arrUsers
     validateEmptyArray $arrPasswd
     validateUserCreated $arrUsers
+    validateUsernameArray $arrUsers
 
     if (-not (Test-Path $RutaLocalUser)) { New-Item -Path $RutaLocalUser -ItemType Directory -Force | Out-Null }
 
@@ -441,8 +579,7 @@ function crearAlumno {
         $uActual = $arrUsers[$i].Trim()
         $pActual = $arrPasswd[$i].Trim()
 
-        if (-not (validateUserName $uActual)) { exit 1 }
-        if (-not (validatePassword  $pActual)) { exit 1 }
+        if (-not (validatePassword $pActual)) { exit 1 }
 
         Write-Host "Creando usuario '$uActual'..." -ForegroundColor Cyan
 
@@ -451,14 +588,14 @@ function crearAlumno {
         Add-LocalGroupMember -Group "Alumnos" -Member $uActual -ErrorAction SilentlyContinue
 
         if (-not (UserExist $uActual)) {
-            Write-Host "Error critico: No se pudo crear el usuario '$uActual'." -ForegroundColor Red
+            Write-Host "No se ha detectado el registro del usuario '$uActual', abortando..." -ForegroundColor Red
             exit 1
         }
 
         $RutaUsuario = "$RutaLocalUser\$uActual"
         if (-not (Test-Path $RutaUsuario)) { New-Item -Path $RutaUsuario -ItemType Directory -Force | Out-Null }
 
-        # ── Resetear y configurar herencia ──────────────────────────────────────
+        # Resetear herencia en todo el arbol
         @($RutaUsuario) + (Get-ChildItem $RutaUsuario -Recurse -Force -ErrorAction SilentlyContinue).FullName |
         ForEach-Object {
             $r = $_
@@ -469,23 +606,21 @@ function crearAlumno {
         }
 
         $acl = Get-Acl $RutaUsuario
-        $acl.SetAccessRuleProtection($true, $false)   # Romper herencia
+        $acl.SetAccessRuleProtection($true, $false)
         Set-Acl -Path $RutaUsuario -AclObject $acl
 
-        # Permisos base de la jaula
         Set-NtfsRule $RutaUsuario "Administrators"      "FullControl"
         Set-NtfsRule $RutaUsuario "SYSTEM"              "FullControl"
         Set-NtfsRule $RutaUsuario "Authenticated Users" "ReadAndExecute"
 
-        # Candado: no puede borrar la raiz de su jaula
+        # Candado: no puede borrar la raiz de la jaula
         $aclDeny = Get-Acl $RutaUsuario
-        $denyRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $aclDeny.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
             "Authenticated Users",
             [System.Security.AccessControl.FileSystemRights]::Delete,
             [System.Security.AccessControl.InheritanceFlags]::None,
             [System.Security.AccessControl.PropagationFlags]::None,
-            "Deny")
-        $aclDeny.AddAccessRule($denyRule)
+            "Deny")))
         Set-Acl -Path $RutaUsuario -AclObject $aclDeny
 
         # Junction a carpeta publica
@@ -493,7 +628,7 @@ function crearAlumno {
             New-Item -ItemType Junction -Path "$RutaUsuario\Publica" -Target "$Ruta\Publica" -Force | Out-Null
         }
 
-        # Carpeta personal del alumno (puede modificar, no puede borrarla)
+        # Carpeta personal (puede modificar, no puede borrarla)
         $carpetaPersonal = "$RutaUsuario\$uActual"
         if (-not (Test-Path $carpetaPersonal)) {
             New-Item -ItemType Directory -Path $carpetaPersonal -Force | Out-Null
@@ -504,30 +639,29 @@ function crearAlumno {
         Set-NtfsRule $carpetaPersonal "Authenticated Users" "Modify"
 
         $aclDenyP = Get-Acl $carpetaPersonal
-        $denyRuleP = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $aclDenyP.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
             "Authenticated Users",
             [System.Security.AccessControl.FileSystemRights]::Delete,
             [System.Security.AccessControl.InheritanceFlags]::None,
             [System.Security.AccessControl.PropagationFlags]::None,
-            "Deny")
-        $aclDenyP.AddAccessRule($denyRuleP)
+            "Deny")))
         Set-Acl -Path $carpetaPersonal -AclObject $aclDenyP
 
         Write-Host "  Usuario '$uActual' creado correctamente." -ForegroundColor Green
     }
 
-    Write-Host "Proceso de creacion de alumno(s) finalizado." -ForegroundColor Green
+    Write-Host "Se ha terminado de anadir a el/los usuario(s) correctamente." -ForegroundColor Green
 }
 
 # ============================================================
 #  OPCION 8 — Eliminar alumno
 # ============================================================
 function deleteUser {
-    param([string]$nombre)
+    param ([string]$nombre)
     $nombre = $nombre.Trim()
 
     if ($script:usuariosSistema -contains $nombre) {
-        Write-Host "Error: '$nombre' es un usuario del sistema y no puede eliminarse." -ForegroundColor Red
+        Write-Host "Se ha detectado que el usuario es un usuario del sistema" -ForegroundColor Red
         exit 1
     }
 
@@ -535,11 +669,10 @@ function deleteUser {
            Where-Object { $_.Description -eq "Alumno" }
 
     if ($null -eq $usr) {
-        Write-Host "No se encontro un alumno con el nombre '$nombre'." -ForegroundColor Red
+        Write-Host "No se ha encontrado al usuario con ese nombre y descripcion" -ForegroundColor Red
         exit 1
     }
 
-    # Eliminar carpeta de la jaula
     $rutaJaula = "C:\FTP\LocalUser\$nombre"
     if (Test-Path $rutaJaula) {
         icacls $rutaJaula /reset /T /C /Q > $null
@@ -549,9 +682,9 @@ function deleteUser {
     Remove-LocalUser -Name $nombre -ErrorAction SilentlyContinue
 
     if (UserExist $nombre) {
-        Write-Host "Error: No se pudo eliminar el usuario '$nombre'." -ForegroundColor Red
+        Write-Host "No se ha eliminado el usuario correctamente" -ForegroundColor Red
     } else {
-        Write-Host "Usuario '$nombre' eliminado correctamente." -ForegroundColor Green
+        Write-Host "Se ha eliminado el usuario correctamente" -ForegroundColor Green
     }
 }
 
@@ -559,63 +692,29 @@ function deleteUser {
 #  OPCION 9 — Consultar alumnos
 # ============================================================
 function consultarAlumnos {
-    Write-Host "`n--- Listado de Alumnos ---" -ForegroundColor Cyan
+    Write-Host "`n--- Listado Oficial de Alumnos (FTP) ---" -ForegroundColor Cyan
     $lista = Get-LocalUser | Where-Object { $_.Description -eq "Alumno" }
     if ($lista) {
-        $lista | Select-Object Name, Enabled, LastLogon | Format-Table -AutoSize
+        $lista | Select-Object Name, Description, Enabled | Format-Table -AutoSize
     } else {
         Write-Host "No hay alumnos registrados." -ForegroundColor Yellow
     }
 }
 
 # ============================================================
-#  OPCION 10 — Crear grupo academico
+#  OPCION 10 — Crear grupo academico  (funcion original de power_fun_par.ps1)
 # ============================================================
-function crearGrupo {
-    param([string]$nombreGrupo, [string]$descripcion)
-    $nombreGrupo = $nombreGrupo.Trim()
-
-    validateEmpty $nombreGrupo "El parametro -groups (nombre de grupo)"
-
-    if ($script:gruposSistema -contains $nombreGrupo) {
-        Write-Host "Error: '$nombreGrupo' es un nombre reservado del sistema." -ForegroundColor Red
-        return
-    }
-    if (Get-LocalGroup -Name $nombreGrupo -ErrorAction SilentlyContinue) {
-        Write-Host "El grupo '$nombreGrupo' ya existe." -ForegroundColor Yellow
-        return
-    }
-
-    $rutaGrupo = "C:\FTP\$nombreGrupo"
-
-    New-LocalGroup -Name $nombreGrupo -Description $descripcion | Out-Null
-
-    if (-not (Test-Path $rutaGrupo)) { New-Item -Path $rutaGrupo -ItemType Directory -Force | Out-Null }
-
-    # Permisos de la carpeta del grupo
-    $acl = Get-Acl $rutaGrupo
-    $acl.SetAccessRuleProtection($true, $false)
-    Set-Acl $rutaGrupo $acl
-
-    Set-NtfsRule $rutaGrupo "Administrators" "FullControl"
-    Set-NtfsRule $rutaGrupo "SYSTEM"         "FullControl"
-    Set-NtfsRule $rutaGrupo $nombreGrupo     "Modify"
-
-    # Denegar acceso al resto de alumnos (IUSR y usuarios no miembros no pueden leer)
-    Set-NtfsRule $rutaGrupo "IUSR" "FullControl" "ContainerInherit,ObjectInherit" "None" "Deny"
-
-    Write-Host "Grupo academico '$nombreGrupo' creado correctamente." -ForegroundColor Green
-}
+# (ya definida arriba como crearGrupo, se llama directamente en el switch)
 
 # ============================================================
 #  OPCION 11 — Eliminar grupo academico
 # ============================================================
 function deleteGroup {
-    param([string]$nombre, [string]$descripcion)
+    param ([string]$nombre, [string]$descripcion)
     $nombre = $nombre.Trim()
 
     if ($script:gruposSistema -contains $nombre) {
-        Write-Host "Error: '$nombre' es un grupo del sistema." -ForegroundColor Red
+        Write-Host "Se ha detectado que el grupo es un grupo del sistema" -ForegroundColor Red
         return
     }
 
@@ -623,12 +722,11 @@ function deleteGroup {
            Where-Object { $_.Description -eq $descripcion }
 
     if ($null -eq $grp) {
-        Write-Host "No se encontro un grupo llamado '$nombre' con descripcion '$descripcion'." -ForegroundColor Yellow
+        Write-Host "No se encontro un grupo llamado '$nombre' con la descripcion '$descripcion'" -ForegroundColor Yellow
         return
     }
 
-    # Eliminar junctions en las jaulas de los miembros
-    Write-Host "Limpiando referencias de usuarios miembros..." -ForegroundColor Cyan
+    Write-Host "Limpiando carpetas de usuarios miembros de '$nombre'..." -ForegroundColor Cyan
     $miembros = Get-LocalGroupMember -Group $nombre -ErrorAction SilentlyContinue
     foreach ($m in $miembros) {
         $mNombre     = $m.Name.Split('\')[-1]
@@ -638,18 +736,16 @@ function deleteGroup {
         }
     }
 
-    # Eliminar carpeta raiz del grupo
-    $rutaGrupo = "C:\FTP\$nombre"
-    if (Test-Path $rutaGrupo) {
-        Remove-Item -Path $rutaGrupo -Recurse -Force -Confirm:$false | Out-Null
+    if (Test-Path "C:\FTP\$nombre") {
+        Remove-Item -Path "C:\FTP\$nombre" -Recurse -Force -Confirm:$false | Out-Null
     }
 
     Remove-LocalGroup -Name $nombre
 
-    if (Get-LocalGroup -Name $nombre -ErrorAction SilentlyContinue) {
-        Write-Host "Error: No se pudo eliminar el grupo '$nombre'." -ForegroundColor Red
+    if ($null -ne (Get-LocalGroup -Name $nombre -ErrorAction SilentlyContinue)) {
+        Write-Host "No se ha eliminado el grupo correctamente" -ForegroundColor Red
     } else {
-        Write-Host "Grupo '$nombre' eliminado correctamente." -ForegroundColor Green
+        Write-Host "Se ha eliminado el grupo '$nombre' y sus subcarpetas correctamente" -ForegroundColor Green
     }
 }
 
@@ -657,7 +753,7 @@ function deleteGroup {
 #  OPCION 12 — Consultar grupos academicos
 # ============================================================
 function consultarGrupos {
-    Write-Host "`n--- Grupos Academicos ---" -ForegroundColor Cyan
+    Write-Host "`n--- Grupos Academicos del Servidor ---" -ForegroundColor Cyan
     $lista = Get-LocalGroup | Where-Object { $_.Description -eq "Grupo Academico" }
     if ($lista) {
         $lista | Select-Object Name, Description | Format-Table -AutoSize
@@ -670,19 +766,19 @@ function consultarGrupos {
 #  SWITCH PRINCIPAL
 # ============================================================
 switch ($option) {
-    "1"  { checkService;                                              break }
-    "2"  { installService;                                            break }
-    "3"  { configureService;                                          break }
-    "4"  { uninstallService;                                          break }
-    "5"  { monitoreo;                                                 break }
-    "6"  { changeGroup -usuario $users -grupoDestino $groups;         break }
-    "7"  { crearAlumno;                                               break }
-    "8"  { deleteUser -nombre $users;                                 break }
-    "9"  { consultarAlumnos;                                          break }
-    "10" { crearGrupo -nombreGrupo $groups -descripcion "Grupo Academico"; break }
-    "11" { deleteGroup -nombre $groups -descripcion "Grupo Academico"; break }
-    "12" { consultarGrupos;                                           break }
+    "1"  { checkService;                                                    break }
+    "2"  { installService;                                                  break }
+    "3"  { configureService;                                                break }
+    "4"  { uninstallService;                                                break }
+    "5"  { monitoreo;                                                       break }
+    "6"  { changeGroup -usuario $users -grupoDestino $groups;               break }
+    "7"  { crearAlumno;                                                     break }
+    "8"  { deleteUser -nombre $users;                                       break }
+    "9"  { consultarAlumnos;                                                break }
+    "10" { crearGrupo  -nombreGrupo $groups -descripcion "Grupo Academico"; break }
+    "11" { deleteGroup -nombre $groups -descripcion "Grupo Academico";      break }
+    "12" { consultarGrupos;                                                 break }
     default {
-        Write-Host "Opcion invalida. Usa -help para ver las opciones disponibles." -ForegroundColor Red
+        Write-Host "Se ha detectado una opcion invalida, vuelve a intentarlo" -ForegroundColor Red
     }
 }
