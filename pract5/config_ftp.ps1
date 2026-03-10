@@ -418,8 +418,8 @@ function configureService {
 
     $cert = New-SelfSignedCertificate -DnsName "MiServidorFTP" -CertStoreLocation "cert:\LocalMachine\My"
     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.serverCertHash"       -Value $cert.Thumbprint
-    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.controlChannelPolicy" -Value "SslRequire"
-    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.dataChannelPolicy"    -Value "SslRequire"
+    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.controlChannelPolicy" -Value "SslAllow"
+    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.dataChannelPolicy"    -Value "SslAllow"
 
     if (-not (Get-NetFirewallRule -Name "Regla_FTP_In" -ErrorAction SilentlyContinue)) {
         New-NetFirewallRule -Name "Regla_FTP_In" -DisplayName "Permitir FTP (Puerto 21)" `
@@ -763,75 +763,97 @@ function consultarGrupos {
 }
 
 # ============================================================
-#  MENU INTERACTIVO (cuando no se pasa -option)
+# ============================================================
+#  MODO INTERACTIVO — ciclo continuo si no se pasa -option
 # ============================================================
 if ([string]::IsNullOrWhiteSpace($option)) {
-    Write-Host "`n╔══════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║       ADMINISTRADOR SERVIDOR FTP     ║" -ForegroundColor Cyan
-    Write-Host "╚══════════════════════════════════════╝" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  --- Servicio ---" -ForegroundColor Yellow
-    Write-Host "  1)  Verificar servicio FTP"
-    Write-Host "  2)  Instalar servicio FTP"
-    Write-Host "  3)  Configuracion inicial (ejecutar tras instalar)"
-    Write-Host "  4)  Desinstalar servicio FTP"
-    Write-Host "  5)  Estatus del servicio"
-    Write-Host ""
-    Write-Host "  --- Usuarios ---" -ForegroundColor Yellow
-    Write-Host "  6)  Mover usuario a un grupo"
-    Write-Host "  7)  Agregar alumno(s)"
-    Write-Host "  8)  Eliminar alumno"
-    Write-Host "  9)  Consultar alumnos"
-    Write-Host ""
-    Write-Host "  --- Grupos ---" -ForegroundColor Yellow
-    Write-Host "  10) Agregar grupo academico"
-    Write-Host "  11) Eliminar grupo academico"
-    Write-Host "  12) Consultar grupos academicos"
-    Write-Host ""
-    Write-Host "  0)  Salir" -ForegroundColor Red
-    Write-Host ""
+    do {
+        # Resetear variables en cada iteracion
+        $users = ""; $passwords = ""; $groups = ""; $no_users = 0
+        $install = $false; $confirm = $false
 
-    $option = Read-Host "  Selecciona una opcion"
-    $option = $option.Trim()
+        Write-Host "`n╔══════════════════════════════════════╗" -ForegroundColor Cyan
+        Write-Host "║       ADMINISTRADOR SERVIDOR FTP     ║" -ForegroundColor Cyan
+        Write-Host "╚══════════════════════════════════════╝" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  --- Servicio ---" -ForegroundColor Yellow
+        Write-Host "  1)  Verificar servicio FTP"
+        Write-Host "  2)  Instalar servicio FTP"
+        Write-Host "  3)  Configuracion inicial (ejecutar tras instalar)"
+        Write-Host "  4)  Desinstalar servicio FTP"
+        Write-Host "  5)  Estatus del servicio"
+        Write-Host ""
+        Write-Host "  --- Usuarios ---" -ForegroundColor Yellow
+        Write-Host "  6)  Mover usuario a un grupo"
+        Write-Host "  7)  Agregar alumno(s)"
+        Write-Host "  8)  Eliminar alumno"
+        Write-Host "  9)  Consultar alumnos"
+        Write-Host ""
+        Write-Host "  --- Grupos ---" -ForegroundColor Yellow
+        Write-Host "  10) Agregar grupo academico"
+        Write-Host "  11) Eliminar grupo academico"
+        Write-Host "  12) Consultar grupos academicos"
+        Write-Host ""
+        Write-Host "  0)  Salir" -ForegroundColor Red
+        Write-Host ""
 
-    # Pedir parametros adicionales segun la opcion elegida
-    switch ($option) {
-        "2" {
-            $install = $true
-        }
-        "4" {
-            $confirm = $true
-        }
-        "6" {
-            $users  = (Read-Host "  Nombre del usuario a mover").Trim()
-            consultarGrupos
-            $groups = (Read-Host "  Nombre del grupo destino").Trim()
-        }
-        "7" {
-            $no_users  = [int](Read-Host "  Cuantos alumnos deseas registrar")
-            $users     = (Read-Host "  Nombres separados por coma (ej: juan,ana)").Trim()
-            $passwords = (Read-Host "  Contrasenas separadas por coma (ej: Pass1!,Pass2!)").Trim()
-        }
-        "8" {
-            consultarAlumnos
-            $users = (Read-Host "  Nombre del alumno a eliminar").Trim()
-        }
-        "10" {
-            $groups = (Read-Host "  Nombre del nuevo grupo academico").Trim()
-        }
-        "11" {
-            consultarGrupos
-            $groups = (Read-Host "  Nombre del grupo a eliminar").Trim()
-        }
-        "0" {
+        $opMenu = (Read-Host "  Selecciona una opcion").Trim()
+
+        if ($opMenu -eq "0") {
             Write-Host "`nHasta luego." -ForegroundColor Cyan
             exit 0
         }
-    }
+
+        # Pedir parametros adicionales segun la opcion
+        switch ($opMenu) {
+            "2"  { $install = $true }
+            "4"  { $confirm = $true }
+            "6"  {
+                $users  = (Read-Host "  Nombre del usuario a mover").Trim()
+                consultarGrupos
+                $groups = (Read-Host "  Nombre del grupo destino").Trim()
+            }
+            "7"  {
+                $no_users  = [int](Read-Host "  Cuantos alumnos deseas registrar")
+                $users     = (Read-Host "  Nombres separados por coma (ej: juan,ana)").Trim()
+                $passwords = (Read-Host "  Contrasenas separadas por coma (ej: Pass1!,Pass2!)").Trim()
+            }
+            "8"  {
+                consultarAlumnos
+                $users = (Read-Host "  Nombre del alumno a eliminar").Trim()
+            }
+            "10" { $groups = (Read-Host "  Nombre del nuevo grupo academico").Trim() }
+            "11" {
+                consultarGrupos
+                $groups = (Read-Host "  Nombre del grupo a eliminar").Trim()
+            }
+        }
+
+        # Ejecutar la opcion elegida
+        switch ($opMenu) {
+            "1"  { checkService }
+            "2"  { installService }
+            "3"  { configureService }
+            "4"  { uninstallService }
+            "5"  { monitoreo }
+            "6"  { changeGroup -usuario $users -grupoDestino $groups }
+            "7"  { crearAlumno }
+            "8"  { deleteUser -nombre $users }
+            "9"  { consultarAlumnos }
+            "10" { crearGrupo  -nombreGrupo $groups -descripcion "Grupo Academico" }
+            "11" { deleteGroup -nombre $groups -descripcion "Grupo Academico" }
+            "12" { consultarGrupos }
+            default { Write-Host "Opcion invalida, intenta de nuevo." -ForegroundColor Red }
+        }
+
+        Write-Host ""
+        Read-Host "  Presiona Enter para continuar"
+
+    } while ($true)
 }
 
 # ============================================================
-#  SWITCH PRINCIPAL
+#  MODO PARAMETROS — ejecucion directa con -option
 # ============================================================
 switch ($option) {
     "1"  { checkService;                                                    break }
