@@ -170,39 +170,23 @@ function Instalar-Configurar {
     Set-ItemProperty $site -Name ftpServer.security.ssl.dataChannelPolicy    -Value 0
 
     # --- Aplicar IsolateAllDirectories ---
-    # Se detiene WAS para que IIS no sobreescriba el config al guardarlo
-    net stop was /y | Out-Null
-    Start-Sleep 2
-
-    [xml]$cfg = Get-Content "C:\Windows\System32\inetsrv\config\applicationHost.config"
-    $sitio = $cfg.configuration.'system.applicationHost'.sites.site |
-        Where-Object { $_.name -eq $SITE_NAME }
-
-    if (-not $sitio.ftpServer) {
-        $nodo = $cfg.CreateElement("ftpServer")
-        $sitio.AppendChild($nodo) | Out-Null
-    }
-    if (-not $sitio.ftpServer.userIsolation) {
-        $nodo = $cfg.CreateElement("userIsolation")
-        $sitio.ftpServer.AppendChild($nodo) | Out-Null
-    }
-
-    $sitio.ftpServer.userIsolation.SetAttribute("mode","IsolateAllDirectories")
-    $cfg.Save("C:\Windows\System32\inetsrv\config\applicationHost.config")
-
-    net start w3svc  | Out-Null
+    net stop ftpsvc | Out-Null
     net start ftpsvc | Out-Null
+    Start-Sleep 3
+
+    & "C:\Windows\System32\inetsrv\appcmd.exe" set site `
+        /site.name:"$SITE_NAME" `
+        /ftpServer.userIsolation.mode:"IsolateAllDirectories"
+
     Start-Sleep 2
 
-    # Verificar
-    [xml]$verify = Get-Content "C:\Windows\System32\inetsrv\config\applicationHost.config"
-    $modo = ($verify.configuration.'system.applicationHost'.sites.site |
-        Where-Object { $_.name -eq $SITE_NAME }).ftpServer.userIsolation.mode
+    $resultado = & "C:\Windows\System32\inetsrv\appcmd.exe" list site `
+        /site.name:"$SITE_NAME" /config /xml
 
-    if ($modo -eq "IsolateAllDirectories") {
+    if ($resultado -match "IsolateAllDirectories") {
         Write-Host "Modo IsolateAllDirectories aplicado correctamente."
     } else {
-        Write-Host "ERROR: No se pudo aplicar el modo de aislamiento. Modo actual: '$modo'"
+        Write-Host "ERROR: No se pudo aplicar el modo de aislamiento."
     }
 
     & "C:\Windows\System32\inetsrv\appcmd.exe" set config `
