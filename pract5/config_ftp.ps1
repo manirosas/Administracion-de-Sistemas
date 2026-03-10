@@ -3,721 +3,815 @@ param (
     [switch] $install,
     [switch] $help,
     [switch] $confirm,
-    [int]    $no_users,
-    [string] $users,
-    [string] $passwords,
-    [string] $groups
+    [int] $no_users,
+    [array] $users,
+    [array] $passwords,
+    [array] $groups
 )
 
-# ============================================================
-#  VECTORES DE SEGURIDAD GLOBALES
-# ============================================================
-$script:gruposSistema = @(
-    "Access Control Assistance Operators", "Administrators", "Backup Operators",
-    "Certificate Service DCOM Access", "Cryptographic Operators", "Device Owners",
-    "Distributed COM Users", "Event Log Readers", "Guests", "Hyper-V Administrators",
-    "IIS_IUSRS", "Network Configuration Operators", "Performance Log Users",
-    "Performance Monitor Users", "Power Users", "Print Operators", "RDS Endpoint Servers",
-    "RDS Management Servers", "RDS Remote Access Servers", "Remote Desktop Users",
-    "Remote Management Users", "Replicator", "Storage Replica Administrators",
-    "System Managed Accounts Group", "Users"
-)
+. ../Funciones/power_fun_par.ps1
 
-$script:usuariosSistema = @(
-    "Administrator",
-    "Guest",
-    "DefaultAccount",
-    "WDAGUtilityAccount",
-    "IUSR",
-    "utilityaccount"
-)
 
-# ============================================================
-#  MENSAJE DE AYUDA
-# ============================================================
-$helpM  = "--- Opciones ---`n`n"
-$helpM += "1)  Verificar existencia del servicio FTP`n"
-$helpM += "2)  Instalar servicio FTP`n"
-$helpM += "3)  Crear sitio FTP y configuracion inicial (IMPORTANTE: ejecutar despues de instalar)`n"
-$helpM += "4)  Desinstalar servicio FTP`n"
-$helpM += "5)  Estatus del servicio FTP`n"
-$helpM += "6)  Mover usuario a un grupo`n`n"
-$helpM += "--- ABC Usuarios ---`n`n"
-$helpM += "7)  Agregar alumno(s)`n"
-$helpM += "8)  Eliminar alumno`n"
-$helpM += "9)  Consultar alumnos`n`n"
-$helpM += "--- ABC Grupos ---`n`n"
-$helpM += "10) Agregar grupo academico`n"
-$helpM += "11) Eliminar grupo academico`n"
-$helpM += "12) Consultar grupos academicos`n`n"
-$helpM += "--- Banderas ---`n`n"
-$helpM += "-help       Mostrar este mensaje`n"
-$helpM += "-option     Seleccionar opcion (1-12)`n"
-$helpM += "-confirm    Confirmar desinstalacion`n"
-$helpM += "-install    Confirmar instalacion`n"
-$helpM += "-no_users   Numero de usuarios a registrar`n"
-$helpM += "-users      Lista de usuarios separados por coma  |  nombre de usuario para cambio de grupo`n"
-$helpM += "-passwords  Lista de contrasenas separadas por coma`n"
-$helpM += "-groups     Grupo destino (opcion 6, 10, 11)`n`n"
-$helpM += "Ejemplos:`n"
-$helpM += "  .\ftp_manager.ps1 -option 7 -no_users 2 -users 'juan,ana' -passwords 'Pass1!,Pass2!'`n"
-$helpM += "  .\ftp_manager.ps1 -option 6 -users 'juan' -groups 'Recursadores'`n"
-$helpM += "  .\ftp_manager.ps1 -option 8 -users 'juan'`n"
+$helpM="--- Opciones ---`n`n"
+$helpM="${helpM}1) Verificar existencia del servicio FTP`n"
+$helpM="${helpM}2) Instalar servicio FTP`n"
+$helpM="${helpM}3) Crear sitio ftp, grupos reprobados y recursadores (configuracion inicial) (IMPORTANTE despues de instalar el servicio)`n"
+$helpM="${helpM}4) Desinstalar servicio FTP`n" # Verificar sintaxis y ver estado del servicio
+$helpM="${helpM}5) Estatus servicio FTP`n"
+$helpM="${helpM}6) Seleccionar usuario para colocarlo en un grupo`n`n"
+$helpM="${helpM}--- ABC Usuarios ---`n`n"
+$helpM="${helpM}7) Agregar usuario`n"
+$helpM="${helpM}8) Eliminar usuario`n"
+$helpM="${helpM}9) Consultar usuario`n`n"
+$helpM="${helpM}--- ABC Grupos ---`n`n"
+$helpM="${helpM}10) Agregar grupo`n`n"
+$helpM="${helpM}11) Eliminar grupo`n`n"
+$helpM="${helpM}12) Consultar grupos existentes`n`n"
+$helpM="${helpM}--- Banderas ---`n`n"
+$helpM="${helpM}-help (mostrar este mensaje)`n"
+$helpM="${helpM}-option (seleccionar opcion)`n"
+$helpM="${helpM}-confirm (confirmar desinstalacion)`n"
+$helpM="${helpM}-install (confirmar instalacion)`n"
+$helpM="${helpM}-no_users (numero de usuarios a registrar)`n" # Verificar sintaxis y ver estado del servicio
+$helpM="${helpM}-users (lista de usuarios separados por una coma | nombre de usuario para cambiarlo de grupo)`n"
+$helpM="${helpM}-passwords (lista de contrase�as separadas por una coma)`n"
+$helpM="${helpM}-groups (grupo al que pertenece separado por comas)`n"
 
-if ($help) { Write-Host $helpM; exit 0 }
-
-$color = "Yellow"
-
-# ============================================================
-#  FUNCIONES DE VALIDACION (power_fun_par.ps1 — integradas)
-# ============================================================
-
-function validateEmpty {
-    param ([string]$value, [string]$var)
-    $value = $value.Trim()
-    if ($value -eq "") {
-        Write-Host "`nSe ha detectado un espacio vacio, saliendo del programa (variable: '$var')" -ForegroundColor Red
-        exit 1
-    }
+if ($help) {
+    Write-Host $helpM
+    exit 1
 }
 
+$color="yellow"
+$ipLocal=""
 
-function validateEmptyArray {
-    param ([array]$array)
-    foreach ($element in $array) {
-        if ($element.Trim() -eq "") {
-            Write-Host "Se ha detectado un valor vacio en el arreglo" -ForegroundColor Red
-            exit 1
-        }
-    }
-}
-
-
-function UserExist {
-    param ([string]$nombre)
-    $nombre = $nombre.Trim()
-    return ($null -ne (Get-LocalUser -Name $nombre -ErrorAction SilentlyContinue))
-}
-
-function validateUserCreated {
-    param ([array]$array)
-    foreach ($element in $array) {
-        $element = $element.Trim()
-        if (UserExist $element) {
-            Write-Host "Se ha encontrado que el usuario '$element' ya ha sido creado" -ForegroundColor Red
-            exit 1
-        }
-    }
-}
-
-function validateUserName {
-    param ([string]$userName)
-    if ($userName.Length -lt 3 -or $userName.Length -gt 20) {
-        Write-Host "Error: El usuario '$userName' debe tener entre 3 y 20 caracteres." -ForegroundColor Red
-        return $false
-    }
-    if ($userName -match '[\\/\[\]:;|=,+*?<>]') {
-        Write-Host "Error: El usuario '$userName' contiene caracteres no permitidos." -ForegroundColor Red
-        return $false
-    }
-    return $true
-}
-
-
-function validatePassword {
-    param ([string]$password)
-    if ([string]::IsNullOrWhiteSpace($password)) {
-        Write-Host "Error: La contrasena no puede estar vacia." -ForegroundColor Red
-        return $false
-    }
-    return $true
-}
-
-# ============================================================
-# OPCION 10 — Crear grupo academico
-# ============================================================
-function crearGrupo {
-    param ([string]$nombreGrupo, [string]$descripcion)
-    $nombreGrupo = $nombreGrupo.Trim()
-
-    if ($script:gruposSistema -contains $nombreGrupo) {
-        Write-Host "Error: No puedes crear el grupo '$nombreGrupo' porque es un grupo reservado del sistema." -ForegroundColor Red
-        return $false
-    }
-    if ($null -ne (Get-LocalGroup -Name $nombreGrupo -ErrorAction SilentlyContinue)) {
-        Write-Host "Aviso: El grupo '$nombreGrupo' ya existe en el servidor." -ForegroundColor Yellow
-        return $false
-    }
-
-    New-LocalGroup -Name $nombreGrupo -Description $descripcion | Out-Null
-
-    $rutaDirectorio = "C:\FTP\$nombreGrupo"
-    if (-not (Test-Path $rutaDirectorio)) { New-Item -Path $rutaDirectorio -ItemType Directory -Force | Out-Null }
-
-    icacls $rutaDirectorio /inheritance:r /grant "Administrators:(OI)(CI)F" /grant "SYSTEM:(OI)(CI)F" /grant "${nombreGrupo}:(OI)(CI)M" /grant "Authenticated Users:(OI)(CI)M" /T /C /Q > $null 2>&1
-    icacls $rutaDirectorio /deny "IUSR:(OI)(CI)F" /T /C /Q > $null 2>&1
-
-    Write-Host "El grupo '$nombreGrupo' y su carpeta han sido creados correctamente!" -ForegroundColor Green
-    return $true
-}
-
+# ─── Función auxiliar ───────────────────────────────────────────────────────
 function Set-NtfsRule {
     param(
         [string]$Path,
         [string]$Identity,
-        [string]$Rights,
+        [string]$Rights,          # e.g. "FullControl","ReadAndExecute","Modify"
         [string]$Inheritance = "ContainerInherit,ObjectInherit",
         [string]$Propagation = "None",
-        [string]$Type = "Allow"
+        [string]$Type = "Allow"   # "Allow" | "Deny"
     )
-    $acl  = Get-Acl -Path $Path
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $acl   = Get-Acl -Path $Path
+    $rule  = New-Object System.Security.AccessControl.FileSystemAccessRule(
                 $Identity, $Rights, $Inheritance, $Propagation, $Type)
     if ($Type -eq "Deny") { $acl.AddAccessRule($rule) }
     else                  { $acl.SetAccessRule($rule) }
     Set-Acl -Path $Path -AclObject $acl
 }
 
-# ============================================================
-#  OPCION 1 — Verificar servicio
-# ============================================================
 function checkService {
-    $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
-    if ($null -eq $svc) {
-        Write-Host "Se ha detectado que no se tiene instalado el servicio FTPSVC" -ForegroundColor Red
-    } else {
-        Write-Host "Se ha detectado el servicio FTPSVC instalado. Estado: $($svc.Status)" -ForegroundColor $color
-    }
+	$aux = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
+
+	if ($aux -eq $null) {
+		Write-Host "Se ha detectado que no se tiene instalado el servicio FTPSVC" -Foregroundcolor "red"
+	} else {
+        Write-Host "Se ha detectado el servicio FTPSVC instalado" -Foreground $color
+    } 
 }
 
-# ============================================================
-#  OPCION 2 — Instalar servicio
-# ============================================================
 function installService {
-    $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
-    if ($null -ne $svc) {
-        Write-Host "Se ha detectado el servicio FTPSVC instalado" -ForegroundColor $color
-        return
-    }
-    Write-Host "Se ha detectado que no se tiene instalado el FTPSVC Server" -ForegroundColor Red
-    if ($install) {
-        Write-Host "Iniciando instalacion..." -ForegroundColor $color
-        Install-WindowsFeature -Name Web-Server, Web-FTP-Server, Web-FTP-Ext -IncludeManagementTools
-        Write-Host "La instalacion ha finalizado correctamente" -ForegroundColor Green
-    } else {
-        Write-Host "Use la bandera -install para activar la instalacion" -ForegroundColor $color
-    }
-}
+	$aux = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
 
-# ============================================================
-#  OPCION 3 — Configuracion inicial del sitio FTP
-# ============================================================
-function configureService {
-    $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
-    if ($null -eq $svc) {
-        Write-Host "Error: El servicio FTPSVC no esta instalado. Ejecuta la opcion 2 primero." -ForegroundColor Red
-        exit 1
-    }
+	if ($aux -eq $null) {
+        Write-Host "Se ha detectado que no se tiene instalado el FTPSVC Server" -Foregroundcolor "red"
 
-    $Name           = "FTP Service"
-    $Ruta           = "C:\FTP"
-    $RutaLocalUser  = "$Ruta\LocalUser"
-    $CarpetaPublica = "$Ruta\Publica"
-    $CarpetaRepro   = "$Ruta\Reprobados"
-    $CarpetaRecurs  = "$Ruta\Recursadores"
-    $PublicJailPath = "$RutaLocalUser\Public"
-    $PublicJunction = "$PublicJailPath\Publica"
-
-    Write-Host "Preparando estructura de directorios..." -ForegroundColor Cyan
-
-    foreach ($dir in @($Ruta, $RutaLocalUser, $CarpetaPublica, $CarpetaRepro, $CarpetaRecurs, $PublicJailPath)) {
-        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
-    }
-    if (-not (Test-Path $PublicJunction)) {
-        New-Item -ItemType Junction -Path $PublicJunction -Target $CarpetaPublica -Force | Out-Null
-    }
-
-    icacls $Ruta /reset /T /C /Q > $null 2>&1
-    if (Test-Path "$Ruta\web.config") { Remove-Item "$Ruta\web.config" -Force -ErrorAction SilentlyContinue }
-
-    Write-Host "Creando grupos base del sistema..." -ForegroundColor Cyan
-    $gruposBase = @(
-        @{Name="Alumnos";      Desc="Identificador Alumnos"},
-        @{Name="Reprobados";   Desc="Grupo Academico"},
-        @{Name="Recursadores"; Desc="Grupo Academico"}
-    )
-    foreach ($g in $gruposBase) {
-        if (-not (Get-LocalGroup -Name $g.Name -ErrorAction SilentlyContinue)) {
-            New-LocalGroup -Name $g.Name -Description $g.Desc | Out-Null
-            Write-Host "  Grupo '$($g.Name)' creado." -ForegroundColor Yellow
+        if ($install) {
+            Write-Host "Iniciando instalacion..." -Foregroundcolor $color
+		    Install-WindowsFeature -Name Web-Server -IncludeAllSubFeature -IncludeManagementTools	
+		    Write-Host "La instalacion ha finalizado correctamente" -Foregroundcolor "green"   
         } else {
-            Write-Host "  Grupo '$($g.Name)' ya existe, omitiendo." -ForegroundColor DarkGray
+            Write-Host "Use la bandera -install para activar la instalacion" -ForegroundColor $color
         }
-    }
 
-    Write-Host "Configurando IIS / FTP..." -ForegroundColor Cyan
-    Import-Module WebAdministration -ErrorAction Stop
-    New-WebFtpSite -Name $Name -Port 21 -PhysicalPath $Ruta -Force | Out-Null
-
-    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.authentication.anonymousAuthentication.enabled" -Value $true
-    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.authentication.basicAuthentication.enabled"   -Value $true
-    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.userIsolation.mode" -Value "IsolateAllDirectories"
-
-    # Limpiar certificado previo si existe
-    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.serverCertHash" -Value "" -ErrorAction SilentlyContinue
-    # SSL/TLS desactivado — conexiones en texto plano permitidas
-    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.controlChannelPolicy" -Value "SslAllow"
-    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.dataChannelPolicy"    -Value "SslAllow"
-    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.ssl128" -Value $false
-
-    if (-not (Get-NetFirewallRule -Name "Regla_FTP_In" -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule -Name "Regla_FTP_In" -DisplayName "Permitir FTP (Puerto 21)" `
-            -Direction Inbound -Protocol TCP -LocalPort 21 -Action Allow | Out-Null
-    }
-
-    Write-Host "Configurando reglas de autorizacion IIS..." -ForegroundColor Cyan
-    Clear-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name -ErrorAction SilentlyContinue
-    Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name `
-        -Value @{accessType="Allow"; users="?"; permissions="Read"}
-    Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name `
-        -Value @{accessType="Allow"; roles="Alumnos"; permissions="Read, Write"}
-
-    Write-Host "Aplicando permisos NTFS..." -ForegroundColor Cyan
-
-    $acl = Get-Acl $Ruta; $acl.SetAccessRuleProtection($true,$false); Set-Acl $Ruta $acl
-    Set-NtfsRule $Ruta "Administrators"      "FullControl"
-    Set-NtfsRule $Ruta "SYSTEM"              "FullControl"
-    Set-NtfsRule $Ruta "IIS_IUSRS"           "ReadAndExecute"
-    Set-NtfsRule $Ruta "IUSR"               "ReadAndExecute"
-    Set-NtfsRule $Ruta "Authenticated Users" "ReadAndExecute"
-
-    Set-NtfsRule $RutaLocalUser "Authenticated Users" "ReadAndExecute"
-    Set-NtfsRule $RutaLocalUser "IUSR"               "ReadAndExecute"
-    Set-NtfsRule $PublicJailPath "IUSR" "ReadAndExecute"
-    Set-NtfsRule $PublicJunction "IUSR" "ReadAndExecute"
-
-    $acl = Get-Acl $CarpetaPublica; $acl.SetAccessRuleProtection($true,$false); Set-Acl $CarpetaPublica $acl
-    Set-NtfsRule $CarpetaPublica "Administrators"      "FullControl"
-    Set-NtfsRule $CarpetaPublica "SYSTEM"              "FullControl"
-    Set-NtfsRule $CarpetaPublica "IUSR"               "ReadAndExecute"
-    Set-NtfsRule $CarpetaPublica "Authenticated Users" "Modify"
-
-    $acl = Get-Acl $CarpetaRepro; $acl.SetAccessRuleProtection($true,$false); Set-Acl $CarpetaRepro $acl
-    Set-NtfsRule $CarpetaRepro "Administrators" "FullControl"
-    Set-NtfsRule $CarpetaRepro "SYSTEM"         "FullControl"
-    Set-NtfsRule $CarpetaRepro "Reprobados"     "Modify"
-    Set-NtfsRule $CarpetaRepro "Recursadores"   "FullControl" "ContainerInherit,ObjectInherit" "None" "Deny"
-    Set-NtfsRule $CarpetaRepro "IUSR"           "FullControl" "ContainerInherit,ObjectInherit" "None" "Deny"
-
-    $acl = Get-Acl $CarpetaRecurs; $acl.SetAccessRuleProtection($true,$false); Set-Acl $CarpetaRecurs $acl
-    Set-NtfsRule $CarpetaRecurs "Administrators" "FullControl"
-    Set-NtfsRule $CarpetaRecurs "SYSTEM"         "FullControl"
-    Set-NtfsRule $CarpetaRecurs "Recursadores"   "Modify"
-    Set-NtfsRule $CarpetaRecurs "Reprobados"     "FullControl" "ContainerInherit,ObjectInherit" "None" "Deny"
-    Set-NtfsRule $CarpetaRecurs "IUSR"           "FullControl" "ContainerInherit,ObjectInherit" "None" "Deny"
-
-    Restart-WebItem "IIS:\Sites\$Name"
-    Write-Host "Configuracion completada con exito." -ForegroundColor Green
+	} else {
+        Write-Host "Se ha detectado el servicio FTPSVC instalado" -Foreground $color
+    } 
 }
 
-# ============================================================
-#  OPCION 4 — Desinstalar servicio
-# ============================================================
 function uninstallService {
-    $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
-    if ($null -eq $svc) {
-        Write-Host "Se ha detectado que no se tiene instalado el servicio FTPSVC" -ForegroundColor Red
-        return
-    }
-    Write-Host "Se ha detectado el servicio FTPSVC instalado" -ForegroundColor $color
-    if ($confirm) {
-        Write-Host "Iniciando desinstalacion..." -ForegroundColor $color
-        Uninstall-WindowsFeature -Name Web-FTP-Server, Web-FTP-Ext
-        Write-Host "La desinstalacion ha finalizado correctamente" -ForegroundColor Red
-    } else {
-        Write-Host "Use la bandera -confirm para confirmar la desinstalacion" -ForegroundColor $color
-    }
-}
+	$aux = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
 
-# ============================================================
-#  OPCION 5 — Monitoreo / estatus
-# ============================================================
-function monitoreo {
-    $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
-    if ($null -eq $svc) {
-        Write-Host "Se ha detectado que no se tiene instalado el servicio FTPSVC" -ForegroundColor Red
-        return
-    }
-    Write-Host "`n=== Estado del servicio ===" -ForegroundColor $color
-    Get-Service -Name "FTPSVC" | Format-Table -AutoSize
-}
+	if ($aux -eq $null) {
+        Write-Host "Se ha detectado que no se tiene instalado el servicio FTPSVC" -Foregroundcolor "red"
 
-# ============================================================
-#  OPCION 6 — Cambiar usuario de grupo
-# ============================================================
+	} else {
+        Write-Host "Se ha detectado el servicio FTPSVC instalado" -Foreground $color
+
+        if ($confirm) {
+            Write-Host "Iniciando desinstalacion..." -Foregroundcolor $color
+            Uninstall-WindowsFeature -Name Web-FTP-Server, Web-FTP-Ext	
+		    Write-Host "La desinstalacion ha finalizado correctamente" -Foregroundcolor red   
+        } else {
+            Write-Host "Use la bandera -c para confirmar " -ForegroundColor $color
+        }
+    } 
+}
+# function changeGroup {
+#     validateEmpty $users
+#     validateEmpty $groups
+
+#     $Ruta="C:\FTP"
+#     $RutaLocalUser = "$Ruta\LocalUser"
+#     $RutaUsuario = "$RutaLocalUser\$users"
+
+#     # Eliminar grupos a los que pertenecia antes el usuario
+#     Get-LocalGroup | Where-Object { `
+#     (Get-LocalGroupMember -Group $_.Name -ErrorAction SilentlyContinue).Name -match $users `
+#     } | ForEach-Object {Remove-LocalGroupMember -Member $users -Group $_.Name}
+
+#     if (-not (Test-Path -Path "$RutaUsuario\$grupos")) { New-Item -ItemType Junction -Path "$RutaUsuario\$grupos" -Target "$Ruta\$grupos" -Force | Out-Null }
+#     if (Test-Path -Path "$RutaUsuario\$grupos") { Remove-Item -Path "$RutaUsuario\$grupos" -Recurse -Confirm:$false | Out-Null }
+
+#     icacls "$RutaUsuario\$grupos" /inheritance:r /grant "Administrators:(OI)(CI)F" /grant "SYSTEM:(OI)(CI)F" /grant "${grupos}:(OI)(CI)M" /T /C /Q 
+#     #icacls "$RutaUsuario\Reprobados" /grant "Authenticated Users:(OI)(CI)(M)" /C /Q
+
+#     Add-LocalGroupMember -Group "$groups" -Member "$users"
+#     Write-Host "Se ha cambiando el grupo del usuario a $groups" -Foregroundcolor green
+# }
+
 function changeGroup {
-    param ([string]$usuario, [string]$grupoDestino)
+    param (
+        [string]$usuario,
+        [string]$grupoDestino
+    )
 
-    $usuario      = $usuario.Trim()
+    $Name="FTP Service";
+    $usuario = $usuario.Trim()
     $grupoDestino = $grupoDestino.Trim()
-    $Ruta         = "C:\FTP"
-    $RutaUsuario  = "$Ruta\LocalUser\$usuario"
+    $Ruta = "C:\FTP"
+    $RutaUsuario = "$Ruta\LocalUser\$usuario"
 
-    validateEmpty $usuario      "users"
-    validateEmpty $grupoDestino "groups"
-
-    if (-not (UserExist $usuario)) {
+    # 1. VERIFICACIÓN: ¿Existe el usuario?
+    if ($null -eq (Get-LocalUser -Name $usuario -ErrorAction SilentlyContinue)) {
         Write-Host "Error: El usuario '$usuario' no existe en el sistema." -ForegroundColor Red
         return
     }
-    if (-not (Get-LocalGroup -Name $grupoDestino -ErrorAction SilentlyContinue)) {
-        Write-Host "Error: El grupo academico '$grupoDestino' no existe." -ForegroundColor Red
+
+    # 2. VERIFICACIÓN: ¿Existe el grupo?
+    if ($null -eq (Get-LocalGroup -Name $grupoDestino -ErrorAction SilentlyContinue)) {
+        Write-Host "Error: El grupo académico '$grupoDestino' no existe." -ForegroundColor Red
         return
     }
+
+    # 3. VERIFICACIÓN DE SEGURIDAD: Que no lo metan a un grupo del sistema
     if ($script:gruposSistema -contains $grupoDestino) {
         Write-Host "Error de seguridad: No puedes mover alumnos a grupos del sistema ($grupoDestino)." -ForegroundColor Red
         return
     }
 
-    $gruposActuales = Get-LocalGroup | Where-Object {
+    # 4. LIMPIEZA SEGURA: Sacarlo solo de los grupos académicos viejos
+    # Usamos tu vector global para NUNCA sacarlo de "Users" u otros grupos vitales
+    $gruposActuales = Get-LocalGroup | Where-Object { 
         ($_.Name -notin $script:gruposSistema) -and ($_.Name -ne "Alumnos") -and
-        ((Get-LocalGroupMember -Group $_.Name -ErrorAction SilentlyContinue).Name -match $usuario)
+        ((Get-LocalGroupMember -Group $_.Name -ErrorAction SilentlyContinue).Name -match $usuario) 
     }
+
     foreach ($grupoViejo in $gruposActuales) {
         Remove-LocalGroupMember -Group $grupoViejo.Name -Member $usuario -ErrorAction SilentlyContinue
-        $rutaTunel = "$RutaUsuario\$($grupoViejo.Name)"
-        if (Test-Path $rutaTunel) { Remove-Item -Path $rutaTunel -Recurse -Force -Confirm:$false | Out-Null }
+        
+        # Borramos el túnel (Junction) viejo de su jaula para que ya no lo vea
+        $rutaTunelViejo = "$RutaUsuario\$($grupoViejo.Name)"
+        if (Test-Path -Path $rutaTunelViejo) {
+            Remove-Item -Path $rutaTunelViejo -Recurse -Force -Confirm:$false | Out-Null
+        }
     }
 
+    # 5. ASIGNACIÓN: Lo metemos al nuevo grupo
     Add-LocalGroupMember -Group $grupoDestino -Member $usuario -ErrorAction SilentlyContinue
 
-    $rutaNuevaTunel = "$RutaUsuario\$grupoDestino"
-    if (-not (Test-Path $rutaNuevaTunel)) {
-        New-Item -ItemType Junction -Path $rutaNuevaTunel -Target "$Ruta\$grupoDestino" -Force | Out-Null
+    # 6. CREACIÓN DEL TÚNEL: Le ponemos el acceso directo a su nueva materia/grupo
+    $rutaNuevoTunel = "$RutaUsuario\$grupoDestino"
+    if (-not (Test-Path -Path $rutaNuevoTunel)) { 
+        New-Item -ItemType Junction -Path $rutaNuevoTunel -Target "$Ruta\$grupoDestino" -Force -Confirm:$false | Out-Null 
     }
 
-    $svc = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
-    if ($null -ne $svc) { Restart-Service ftpsvc }
+    # 7. PERMISOS: Aseguramos el túnel en silencio
+    #icacls $rutaNuevoTunel /grant "${grupoDestino}:(OI)(CI)(RX)" /T /C /Q
+    #icacls $rutaNuevoTunel /inheritance:r /grant "Administrators:(OI)(CI)F" /grant "SYSTEM:(OI)(CI)F" /grant "Authenticated Users:(OI)(CI)(RX)" /T /C /Q > $null 2>&1 
 
-    Write-Host "Se ha cambiado al usuario '$usuario' al grupo '$grupoDestino' con exito" -ForegroundColor Green
+
+
+	$aux = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
+
+	if ($aux -ne $null) {
+		Restart-Service ftpsvc
+    }
+
+    Write-Host "Se ha cambiado al usuario '$usuario' al grupo '$grupoDestino' con éxito" -ForegroundColor Green
 }
 
-# ============================================================
-#  OPCION 7 — Crear alumno(s)
-# ============================================================
+function deleteUser {
+    param (
+        [string] $nombre,
+        [string] $descripcion
+    )
+
+    $nombre=$nombre.Trim();
+
+    if ($nombre -contains $script:usuariosSistema) {
+        Write-Host "Se ha detectado que el usuario es un usuario del sistema" -ForegroundColor red
+        exit 1;
+    }
+
+    $aux = $aux = Get-LocalUser -Name $nombre -ErrorAction SilentlyContinue | Where-Object { $_.Description -eq $descripcion }
+
+    if ($aux -ne $null) {
+         if (Test-Path -Path "C:\FTP\LocalUser\$nombre") {
+            icacls "C:\FTP\LocalUser\$nombre" /reset /T /c /q > $null
+            Remove-Item -Path "C:\FTP\LocalUser\$nombre" -Recurse -Confirm:$false | Out-Null 
+        }
+
+        Remove-LocalUser -Name "$nombre" -ErrorAction SilentlyContinue
+        
+        if (UserExist -nombre $nombre) {
+            Write-Host "No se ha eliminado el usuario correctamente" -ForegroundColor red
+        } else {
+            Write-Host "Se ha eliminado el usuario correctamente" -ForegroundColor green      
+        }
+    } else {
+        Write-Host "No se ha encontrado al usuario con ese nombre y descripcion" -ForegroundColor Red
+        exit 1
+    }
+}
+
+function deleteGroup {
+    param (
+        [string] $nombre,
+        [string] $descripcion
+    )
+
+    $nombre = $nombre.Trim()
+
+    # 1. Validamos contra los grupos del sistema
+    if ($script:gruposSistema -contains $nombre) {
+        Write-Host "Se ha detectado que el grupo es un grupo del sistema" -ForegroundColor red
+        return 
+    }
+
+    # 2. Buscamos el grupo y verificamos su descripción
+    $aux = Get-LocalGroup -Name $nombre -ErrorAction SilentlyContinue | Where-Object { $_.Description -eq $descripcion }
+
+    if ($aux -ne $null) {
+        
+        ### NUEVO: Borrar carpetas de los usuarios pertenecientes al grupo ###
+        Write-Host "Limpiando carpetas de usuarios miembros de '$nombre'..." -ForegroundColor Cyan
+        
+        $miembros = Get-LocalGroupMember -Group $nombre -ErrorAction SilentlyContinue
+        
+        foreach ($miembro in $miembros) {
+            # Asumimos la ruta: C:\FTP\LocalUser\NombreUsuario\NombreGrupo
+            $miembroNombre = $miembro.Name.Split('\')[-1]
+            $rutaCarpetaUsuario = "C:\FTP\LocalUser\$($miembroNombre)\$nombre"
+            
+            if (Test-Path -Path $rutaCarpetaUsuario) {
+                Write-Host " -> Eliminando carpeta de usuario: $rutaCarpetaUsuario" -ForegroundColor Gray
+                Remove-Item -Path $rutaCarpetaUsuario -Recurse -Force -Confirm:$false | Out-Null
+            }
+        }
+        ######################################################################
+
+        # 3. Borramos la carpeta raíz compartida del grupo (C:\FTP\Reprobados)
+        if (Test-Path -Path "C:\FTP\$nombre") {
+            Remove-Item -Path "C:\FTP\$nombre" -Recurse -Force -Confirm:$false | Out-Null 
+        }
+        
+        # 4. Borramos el grupo de Windows
+        Remove-LocalGroup -Name $nombre 
+        
+        # 5. Verificamos eliminación
+        $comprobacion = Get-LocalGroup -Name $nombre -ErrorAction SilentlyContinue
+        if ($comprobacion -ne $null) {
+            Write-Host "No se ha eliminado el grupo correctamente" -ForegroundColor red
+        } else {
+            Write-Host "Se ha eliminado el grupo '$nombre' y sus subcarpetas correctamente" -ForegroundColor green      
+        }
+    } else {
+        Write-Host "No se encontró un grupo llamado '$nombre' con la descripción '$descripcion'" -ForegroundColor yellow
+    }
+}
+
+#function consultarGrupos {
+#    Write-Host "--- Grupos del Servidor FTP ---" -ForegroundColor Cyan
+#    # La función 'lee' el vector que está afuera
+#    Get-LocalGroup | Where-Object { $_.Name -notin $script:gruposSistema } | Select-Object Name | Format-Table -AutoSize
+#}
+
+function consultarAlumnos {
+    Write-Host "--- Listado Oficial de Alumnos (FTP) ---" -ForegroundColor Cyan
+
+    # Filtramos por el campo Description
+    Get-LocalUser | Where-Object { $_.Description -eq "Alumno" } | 
+        Select-Object Name, Description, Enabled | 
+        Format-Table -AutoSize
+}
+
+function consultarGrupos {
+    Write-Host "--- Grupos Academicos del Servidor ---" -ForegroundColor Cyan
+    Get-LocalGroup | Where-Object { $_.Description -eq "Grupo Academico" } | 
+        Select-Object Name, Description | 
+        Format-Table -AutoSize
+}
+
 function crearAlumno {
-    $Ruta          = "C:\FTP"
-    $RutaLocalUser = "$Ruta\LocalUser"
+    param (
+        [string] $descripcion
+    )
+    $Ruta="C:\FTP"
+    $users = $users -split ","
+    $passwords = $passwords -split ","
 
-    $arrUsers  = $users     -split ","
-    $arrPasswd = $passwords -split ","
-
-    if ($arrUsers.Length -ne $no_users -or $arrPasswd.Length -ne $no_users) {
-        Write-Host "El numero de usuarios y contrasenas debe coincidir con -no_users ($no_users)." -ForegroundColor Red
+    # 1. Mensaje corregido (ya no menciona grupos)
+    if ($users.Length -ne $no_users -or $passwords.Length -ne $no_users ) {
+        Write-Host "El número de usuarios y contraseñas debe coincidir con -no_users" -ForegroundColor red
         exit 1
     }
 
-    validateEmptyArray $arrUsers
-    validateEmptyArray $arrPasswd
-    validateUserCreated $arrUsers
-    validateUsernameArray $arrUsers
+    validateEmptyArray $users
+    validateEmptyArray $passwords
+    validateUserCreated $users # Asumo que esta función ya maneja el array completo
 
-    if (-not (Test-Path $RutaLocalUser)) { New-Item -Path $RutaLocalUser -ItemType Directory -Force | Out-Null }
+    $RutaLocalUser = "$Ruta\LocalUser"
+    if (-not (Test-Path -Path $RutaLocalUser)) { New-Item -Path $RutaLocalUser -ItemType Directory -Force | Out-Null }
 
-    for ($i = 0; $i -lt $no_users; $i++) {
-        $uActual = $arrUsers[$i].Trim()
-        $pActual = $arrPasswd[$i].Trim()
+    for($i=0; $i -lt $no_users; $i++) {
+        $usuarioActual = $users[$i].Trim()
+        $passActual = $passwords[$i]
 
-        if (-not (validatePassword $pActual)) { exit 1 }
+        # 2. Validamos el formato individualmente antes de crear nada
+        if (-not (validateUserName $usuarioActual)) { exit 1 }
+        if (-not (validatePassword $passActual)) { exit 1 }
 
-        Write-Host "Creando usuario '$uActual'..." -ForegroundColor Cyan
+        # Creación del usuario con su etiqueta
+        $aux = ConvertTo-SecureString -String "$passActual" -AsPlainText -Force
+        New-LocalUser -Name $usuarioActual -Description "Alumno" -Password $aux -PasswordNeverExpires | Out-Null
 
-        $secPass = ConvertTo-SecureString -String $pActual -AsPlainText -Force
-        New-LocalUser -Name $uActual -Description "Alumno" -Password $secPass -PasswordNeverExpires | Out-Null
-        Add-LocalGroupMember -Group "Alumnos" -Member $uActual -ErrorAction SilentlyContinue
+        Add-LocalGroupMember -Group "Alumnos" -Member $usuarioActual -ErrorAction SilentlyContinue
 
-        if (-not (UserExist $uActual)) {
-            Write-Host "No se ha detectado el registro del usuario '$uActual', abortando..." -ForegroundColor Red
+        if (-not (UserExist $usuarioActual)) {
+            Write-Host "No se ha detectado el registro del usuario '$usuarioActual', abortando..." -ForegroundColor Red
             exit 1
         }
 
-        $RutaUsuario = "$RutaLocalUser\$uActual"
-        if (-not (Test-Path $RutaUsuario)) { New-Item -Path $RutaUsuario -ItemType Directory -Force | Out-Null }
+        # Rutas de aislamiento
+        $RutaUsuario = "$RutaLocalUser\$usuarioActual"
 
-        # Resetear herencia en todo el arbol
-        @($RutaUsuario) + @((Get-ChildItem $RutaUsuario -Recurse -Force -ErrorAction SilentlyContinue).FullName) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        ForEach-Object {
-            $r = $_
-            $a = Get-Acl $r
-            $a.SetAccessRuleProtection($false, $false)
-            $a.Access | ForEach-Object { $a.RemoveAccessRule($_) } | Out-Null
-            Set-Acl -Path $r -AclObject $a
+        if (-not (Test-Path -Path "$RutaUsuario")) { 
+            New-Item -Path "$RutaUsuario" -ItemType Directory -Force | Out-Null
         }
 
+        # 3. Permisos de la jaula en silencio total
+        # ─── $RutaUsuario : deshabilitar herencia y aplicar permisos base ────────────
+        $acl = Get-Acl -Path $RutaUsuario
+        $acl.SetAccessRuleProtection($true, $false)   # /inheritance:r  (rompe herencia, no copia reglas existentes)
+        Set-Acl -Path $RutaUsuario -AclObject $acl
+
+        Set-NtfsRule $RutaUsuario "Administrators"       "FullControl"
+        Set-NtfsRule $RutaUsuario "SYSTEM"               "FullControl"
+        Set-NtfsRule $RutaUsuario "Authenticated Users"  "ReadAndExecute"
+        Set-NtfsRule $RutaUsuario $usuarioActual         "ReadAndExecute"
+
+        # ─── Aplicar recursivo a todo el árbol (/T) ──────────────────────────────────
+        Get-ChildItem -Path $RutaUsuario -Recurse -Force | ForEach-Object {
+            Set-NtfsRule $_.FullName "Authenticated Users" "ReadAndExecute"
+        }
+        #Write-Host "el valor de rutausuario es $RutaUsuario"
+        #Write-Host "el valor de rutausuario es $RutaUsuario"
+        #Write-Host "el valor de rutausuario es $RutaUsuario"
+
+        # Implementar Junctions
+        if (-not (Test-Path -Path "$RutaUsuario\Publica")) { 
+            New-Item -ItemType Junction -Path "$RutaUsuario\Publica" -Target "$Ruta\Publica" -Force | Out-Null 
+        }
+
+        # Crear subcarpeta personal
+        if (-not (Test-Path -Path "$RutaUsuario\$usuarioActual")) { 
+            New-Item -ItemType Directory -Path "$RutaUsuario\$usuarioActual" -Force | Out-Null 
+        }
+
+
+        # 1. RESET /T : eliminar reglas explícitas y re-habilitar herencia en todo el árbol
+        @($RutaUsuario) + (Get-ChildItem $RutaUsuario -Recurse -Force).FullName | ForEach-Object {
+            $rutaActual = $_                          # ← guardamos la ruta aquí
+            $acl = Get-Acl $rutaActual
+            $acl.SetAccessRuleProtection($false, $false)
+            $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) } | Out-Null
+            Set-Acl -Path $rutaActual -AclObject $acl  # ← usamos la variable, no $_
+        }
+
+        # 2. Romper herencia SIN copiar reglas del padre  (/inheritance:r)
         $acl = Get-Acl $RutaUsuario
         $acl.SetAccessRuleProtection($true, $false)
         Set-Acl -Path $RutaUsuario -AclObject $acl
 
-        Set-NtfsRule $RutaUsuario "Administrators"      "FullControl"
-        Set-NtfsRule $RutaUsuario "SYSTEM"              "FullControl"
-        Set-NtfsRule $RutaUsuario "Authenticated Users" "ReadAndExecute"
+        # 3. Authenticated Users : Modify heredable  (OI)(CI)M
+        Set-NtfsRule $RutaUsuario "Authenticated Users" "ReadAndExecute" "ContainerInherit,ObjectInherit" "None" "Allow"
 
-        # Candado: no puede borrar la raiz de la jaula
-        $aclDeny = Get-Acl $RutaUsuario
-        $aclDeny.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-            "Authenticated Users",
-            [System.Security.AccessControl.FileSystemRights]::Delete,
-            [System.Security.AccessControl.InheritanceFlags]::None,
-            [System.Security.AccessControl.PropagationFlags]::None,
-            "Deny")))
-        Set-Acl -Path $RutaUsuario -AclObject $aclDeny
+        # 4. Administrators y SYSTEM : FullControl heredable  (OI)(CI)F
+        Set-NtfsRule $RutaUsuario "Administrators" "FullControl" "ContainerInherit,ObjectInherit" "None" "Allow"
+        Set-NtfsRule $RutaUsuario "SYSTEM"         "FullControl" "ContainerInherit,ObjectInherit" "None" "Allow"
 
-        # Junction a carpeta publica
-        if (-not (Test-Path "$RutaUsuario\Publica")) {
-            New-Item -ItemType Junction -Path "$RutaUsuario\Publica" -Target "$Ruta\Publica" -Force | Out-Null
-        }
+        # 5. CANDADO: Denegar Delete SOLO en esta carpeta raíz (sin (OI)(CI) → sin herencia)
+        $acl  = Get-Acl $RutaUsuario
+        $deny = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    "Authenticated Users",
+                    [System.Security.AccessControl.FileSystemRights]::Delete,
+                    [System.Security.AccessControl.InheritanceFlags]::None,      # sin (OI)(CI)
+                    [System.Security.AccessControl.PropagationFlags]::None,
+                    "Deny")
+        $acl.AddAccessRule($deny)
+        Set-Acl -Path $RutaUsuario -AclObject $acl
 
-        # Carpeta personal (puede modificar, no puede borrarla)
-        $carpetaPersonal = "$RutaUsuario\$uActual"
-        if (-not (Test-Path $carpetaPersonal)) {
-            New-Item -ItemType Directory -Path $carpetaPersonal -Force | Out-Null
-        }
+        Set-NtfsRule "$RutaUsuario\$usuarioActual" "Authenticated Users" "Modify" "ContainerInherit,ObjectInherit" "None" "Allow"
 
-        Set-NtfsRule $carpetaPersonal "Administrators"      "FullControl"
-        Set-NtfsRule $carpetaPersonal "SYSTEM"              "FullControl"
-        Set-NtfsRule $carpetaPersonal "Authenticated Users" "Modify"
+        # 4. Administrators y SYSTEM : FullControl heredable  (OI)(CI)F
+        Set-NtfsRule "$RutaUsuario\$usuarioActual" "Administrators" "FullControl" "ContainerInherit,ObjectInherit" "None" "Allow"
+        Set-NtfsRule "$RutaUsuario\$usuarioActual" "SYSTEM"         "FullControl" "ContainerInherit,ObjectInherit" "None" "Allow"
 
-        $aclDenyP = Get-Acl $carpetaPersonal
-        $aclDenyP.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-            "Authenticated Users",
-            [System.Security.AccessControl.FileSystemRights]::Delete,
-            [System.Security.AccessControl.InheritanceFlags]::None,
-            [System.Security.AccessControl.PropagationFlags]::None,
-            "Deny")))
-        Set-Acl -Path $carpetaPersonal -AclObject $aclDenyP
+        $acl  = Get-Acl "$RutaUsuario\$usuarioActual"
+        $deny = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    "Authenticated Users",
+                    [System.Security.AccessControl.FileSystemRights]::Delete,
+                    [System.Security.AccessControl.InheritanceFlags]::None,      # sin (OI)(CI)
+                    [System.Security.AccessControl.PropagationFlags]::None,
+                    "Deny")
+        $acl.AddAccessRule($deny)
+        Set-Acl -Path "$RutaUsuario\$usuarioActual" -AclObject $acl
 
-        Write-Host "  Usuario '$uActual' creado correctamente." -ForegroundColor Green
+        # Permisos de la subcarpeta personal en silencio total
+        #icacls "$RutaUsuario\$usuarioActual" /inheritance:r /grant "Authenticated Users:(OI)(CI)(M)" /grant "Administrators:(OI)(CI)F" /grant "SYSTEM:(OI)(CI)F" /T /C /Q > $null 2>&1
+        # 2. Permisos en la CARPETA PERSONAL (Escribir SI, Borrar carpeta NO)
+        # AD = Append Data (Crear carpetas)
+        # WD = Write Data (Crear archivos)
+        # S = Synchronize
+        #icacls "$RutaUsuario\$usuarioActual" /grant "$($usuarioActual):(OI)(CI)(M)" /T /C /Q 
+        #icacls "$RutaUsuario\$usuarioActual" /grant "Authenticated Users:(OI)(CI)(M)" /T /C /Q 
+
+        # 3. Quitamos explícitamente el permiso de eliminar (D = Delete)
+        #icacls "$RutaUsuario\$usuarioActual" /deny "$($usuarioActual):(D)" /C /Q 
+        #icacls "$RutaUsuario\$usuarioActual" /deny "Authenticated Users:(D)" /C /Q 
+
     }
 
-    Write-Host "Se ha terminado de anadir a el/los usuario(s) correctamente." -ForegroundColor Green
+    Write-Host "Se ha terminado de añadir a el/los usuario(s) correctamente." -Foregroundcolor green    
 }
 
-# ============================================================
-#  OPCION 8 — Eliminar alumno
-# ============================================================
-function deleteUser {
-    param ([string]$nombre)
-    $nombre = $nombre.Trim()
+function GroupExist {
+    param ([string]$nombreGrupo)
+    # Ya no necesitas declarar el vector aquí, solo lo usas
+    return $nombreGrupo.Trim() -in $script:gruposSistema
+}
 
-    if ($script:usuariosSistema -contains $nombre) {
-        Write-Host "Se ha detectado que el usuario es un usuario del sistema" -ForegroundColor Red
+# function addUsers {
+#     $Ruta="C:\FTP"
+#     $users = $users -split ","
+#     $passwords = $passwords -split ","
+#     $groups = $groups -split ","
+
+#     if ($users.Length -ne $no_users -or $passwords.Length -ne $no_users -or $groups.Length -ne $no_users) {
+#         Write-Host "El número de usuarios, contraseñas y grupos debe coincidir con -no_users" -ForegroundColor red
+#         exit 1
+#     }
+
+#     validateEmptyArray $users
+#     validateEmptyArray $passwords
+#     validateEmptyArray $groups
+
+#     validateGroupNumber $groups 
+#     validateUserCreated $users 
+
+#     # 1. Crear la carpeta maestra de aislamiento obligatoria de IIS
+#     $RutaLocalUser = "$Ruta\LocalUser"
+#     if (-not (Test-Path -Path $RutaLocalUser)) { New-Item -Path $RutaLocalUser -ItemType Directory -Force | Out-Null }
+
+#     for($i=0; $i -lt $no_users; $i++) {
+
+#         # 2. La nueva ruta del usuario ahora estará enjaulada
+#         $RutaUsuario = "$RutaLocalUser\$($users[$i])"
+
+#         if (-not (Test-Path -Path "$RutaUsuario")) {
+#             New-Item -Path "$RutaUsuario" -ItemType Directory -Force | Out-Null
+#         }
+
+#         # 3. Permisos de su jaula personal (Solo el usuario, SYSTEM y Admin entran) # F -> RX
+#         icacls $RutaUsuario /inheritance:r /grant "$($users[$i]):(OI)(CI)(RX)" /grant "Administrators:(OI)(CI)F" /grant "SYSTEM:(OI)(CI)F" /T /C /Q
+
+#         # 4. IMPLEMENTAR LOS "MOUNTS" (Junctions) hacia las carpetas compartidas
+#         if (-not (Test-Path -Path "$RutaUsuario\Publica")) { New-Item -ItemType Junction -Path "$RutaUsuario\Publica" -Target "$Ruta\Publica" -Force | Out-Null }
+
+#         # 5. Asignar el usuario a su grupo
+#         if ( "$($groups[$i])" -eq "1" ) {
+#             if (-not (Test-Path -Path "$RutaUsuario\Reprobados")) { New-Item -ItemType Junction -Path "$RutaUsuario\Reprobados" -Target "$Ruta\Reprobados" -Force | Out-Null }
+#             Add-LocalGroupMember -Group "Reprobados" -Member "$($users[$i])"
+#             Add-LocalGroupMember -Group "Users" -Member "$($users[$i])"
+#         } elseif ( "$($groups[$i])" -eq "2" ) {
+#             if (-not (Test-Path -Path "$RutaUsuario\Recursadores")) { New-Item -ItemType Junction -Path "$RutaUsuario\Recursadores" -Target "$Ruta\Recursadores" -Force | Out-Null }
+#             Add-LocalGroupMember -Group "Recursadores" -Member "$($users[$i])"
+#             Add-LocalGroupMember -Group "Users" -Member "$($users[$i])"
+#         }
+
+#         # 6. Crear la carpeta personal
+#         if (-not (Test-Path -Path "$RutaUsuario\$($users[$i])")) { New-Item -ItemType Directory -Path "$RutaUsuario\$($users[$i])" -Force | Out-Null }
+#     }
+
+#     Write-Host "Se ha terminado de añadir a los usuarios correctamente." -Foregroundcolor green
+# }
+
+# function configureService {
+# 	$aux = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
+
+# 	if ($aux -eq $null) {
+#         exit 1
+# 	}
+
+#     $Name="FTP Service"
+#     $Ruta="C:\FTP"
+#     $CarpetaA="$Ruta\Reprobados"
+#     $CarpetaB="$Ruta\Recursadores"
+#     $CarpetaC="$Ruta\Publica"
+
+#     # Crear la carpeta
+#     New-Item -Path $Ruta -ItemType Directory -Force    
+
+#     # Creación del sitio FTP
+#     New-WebFtpSite -Name $Name -Port 21 -PhysicalPath $Ruta -Force
+
+#     # Creación de grupos
+#     $aux = Get-LocalGroup | findstr "Reprobados"
+
+#     if($aux -eq $null) {
+#         New-LocalGroup -Name "Reprobados" -Description "Reprobados"
+#     } 
+
+#     $aux = Get-LocalGroup | findstr "Recursadores"
+
+#     if($aux -eq $null) {
+#         New-LocalGroup -Name "Recursadores" -Description "Recursadores"
+#     }
+
+# # 1. Borrar el archivo maldito para que deje de estorbar
+#     if (Test-Path "$Ruta\web.config") { 
+#         Remove-Item "$Ruta\web.config" -Force -ErrorAction SilentlyContinue 
+#     }
+
+#     # 2. Limpiar cualquier regla previa apuntando al cerebro central de IIS
+#     Clear-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name -ErrorAction SilentlyContinue
+
+#     # 3. Añadir permisos apuntando al cerebro central (usando -Location $Name)
+#     Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name -Value @{accessType="Allow"; users="?"; permissions="Read"}
+
+#     Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name -Value @{accessType="Allow"; users="*"; permissions="Read"}
+
+#     Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name -Value @{accessType="Allow"; roles="Reprobados, Recursadores"; permissions="Read, Write"}
+
+#     # 2. Rompemos la herencia de la raíz
+#     icacls $Ruta /inheritance:r /C /Q
+
+#     # 3. Damos permisos totales al Sistema y Administradores (para que PowerShell no falle)
+#     icacls $Ruta /grant "Administrators:(OI)(CI)F" /C /Q
+#     icacls $Ruta /grant "SYSTEM:(OI)(CI)F" /C /Q
+
+#     # 4. Le damos permiso a IIS para que pueda leer su configuración
+#     icacls $Ruta /grant "IIS_IUSRS:(OI)(CI)RX" /C /Q
+
+#     # 5. Permisos de lectura base para usuarios anónimos y registrados
+#     icacls $Ruta /grant "IUSR:(OI)(CI)RX" /C /Q
+#     icacls $Ruta /grant "Authenticated Users:(OI)(CI)RX" /C /Q
+
+#     # Permitir acceso anónimo
+#     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.authentication.anonymousAuthentication.enabled" -Value $true
+
+#     # Habilitar autenticación básica
+#     Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.authentication.basicAuthentication.enabled" -Value $true
+
+#     # Dar permisos de lectura y escritura a todos los usuarios de Windows (*)
+#     Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\Sites\$Name" -Value @{accessType="Allow"; users="*"; permissions="Read, Write"} 
+
+#     $aux = Get-NetFirewallRule -Name "Regla_FTP_In" -ErrorAction SilentlyContinue
+
+#     if ($aux -eq $null) {
+#         New-NetFirewallRule -Name "Regla_FTP_In" -DisplayName "Permitir FTP (Puerto 21)" -Direction Inbound -Protocol TCP -LocalPort 21 -Action Allow
+#     }
+
+#     if (-not (Test-Path -Path "$CarpetaA" -PathType Container)) {
+#         New-Item -Path "$CarpetaA" -ItemType Directory -Force
+#     }
+
+#     if (-not (Test-Path -Path "$CarpetaB" -PathType Container)) {
+#         New-Item -Path "$CarpetaB" -ItemType Directory -Force
+#     }
+
+#     if (-not (Test-Path -Path "$CarpetaC" -PathType Container)) {
+#         New-Item -Path "$CarpetaC" -ItemType Directory -Force
+#     }
+
+
+
+#     # 1. Configurar Carpeta A (Solo Grupo A, Administradores y Sistema)
+#     icacls $CarpetaA /inheritance:r /T /C /Q  # Rompe la herencia
+#     icacls $CarpetaA /grant "Reprobados:(OI)(CI)M" /T /C /Q # 'M' es permiso de Modificar (Lectura/Escritura)
+#     icacls $CarpetaA /grant "Administrators:(OI)(CI)F" /T /C /Q # 'F' es Control Total
+#     icacls $CarpetaA /grant "SYSTEM:(OI)(CI)F" /T /C /Q
+
+#     # 2. Configurar Carpeta B (Solo Grupo B, Administradores y Sistema)
+#     icacls $CarpetaB /inheritance:r /T /C /Q
+#     icacls $CarpetaB /grant "Recursadores:(OI)(CI)M" /T /C /Q
+#     icacls $CarpetaB /grant "Administrators:(OI)(CI)F" /T /C /Q
+#     icacls $CarpetaB /grant "SYSTEM:(OI)(CI)F" /T /C /Q
+
+#     # 1. Romper la herencia de la carpeta
+#     icacls $CarpetaC /inheritance:r /T /C /Q
+
+#     # 2. Permisos base para el sistema y administradores (Control Total)
+#     icacls $CarpetaC /grant "Administrators:(OI)(CI)F" /T /C /Q
+#     icacls $CarpetaC /grant "SYSTEM:(OI)(CI)F" /T /C /Q
+
+#     # 3. Permiso de SOLO LECTURA para el usuario anónimo
+#     icacls $CarpetaC /grant "IUSR:(OI)(CI)R" /T /C /Q
+
+#     # 4. Permiso de LECTURA Y ESCRITURA para cualquier usuario que inicie sesión
+#     icacls $CarpetaC /grant "Authenticated Users:(OI)(CI)M" /T /C /Q
+
+#     Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\Sites\$Name" -Value @{accessType="Allow"; users="*"; permissions="Read, Write"} -ErrorAction SilentlyContinue
+
+#     Import-Module WebAdministration
+
+#     # 1. Crear un certificado SSL auto-firmado
+#     $Cert = New-SelfSignedCertificate -DnsName "MiServidorFTP" -CertStoreLocation "cert:\LocalMachine\My"
+
+#     # 2. Asignar el certificado al servidor FTP usando su "huella digital" (Thumbprint)
+#     Set-ItemProperty -Path "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.serverCertHash" -Value $Cert.Thumbprint
+
+#     Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\Sites\$Name" -Value @{accessType="Allow"; roles="Reprobados, Recursadores"; permissions="Read, Write"} 
+    
+#     Restart-WebItem "IIS:\Sites\$Name"
+# }
+function configureService {
+    $aux = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
+
+    if ($aux -eq $null) {
         exit 1
     }
 
-    $usr = Get-LocalUser -Name $nombre -ErrorAction SilentlyContinue |
-           Where-Object { $_.Description -eq "Alumno" }
+    $Name="FTP Service"
+    $Ruta="C:\FTP"
+    $Anonymous="$Ruta\Anonymous"
+    $RutaLocalUser = "$Ruta\LocalUser"
+    $AnonymousJunction="$RutaLocalUser\Public\Publica"
+    $CarpetaA="$Ruta\Reprobados"
+    $CarpetaB="$Ruta\Recursadores"
+    $CarpetaC="$Ruta\Publica"
 
-    if ($null -eq $usr) {
-        Write-Host "No se ha encontrado al usuario con ese nombre y descripcion" -ForegroundColor Red
-        exit 1
-    }
+    Write-Host "Preparando estructura de directorios..." -ForegroundColor Cyan
 
-    $rutaJaula = "C:\FTP\LocalUser\$nombre"
-    if (Test-Path $rutaJaula) {
-        icacls $rutaJaula /reset /T /C /Q > $null
-        Remove-Item -Path $rutaJaula -Recurse -Force -Confirm:$false | Out-Null
-    }
+    # 1. Crear las carpetas si no existen
+    if (-not (Test-Path -Path $Ruta)) { New-Item -Path $Ruta -ItemType Directory -Force | Out-Null }
+    if (-not (Test-Path -Path $CarpetaA)) { New-Item -Path $CarpetaA -ItemType Directory -Force | Out-Null }
+    if (-not (Test-Path -Path $CarpetaB)) { New-Item -Path $CarpetaB -ItemType Directory -Force | Out-Null }
+    if (-not (Test-Path -Path $CarpetaC)) { New-Item -Path $CarpetaC -ItemType Directory -Force | Out-Null }
 
-    Remove-LocalUser -Name $nombre -ErrorAction SilentlyContinue
+    #1.1 Crear carpeta para aislamiento de usuarios
+    if (-not (Test-Path -Path $RutaLocalUser)) { New-Item -Path $RutaLocalUser -ItemType Directory -Force | Out-Null }
 
-    if (UserExist $nombre) {
-        Write-Host "No se ha eliminado el usuario correctamente" -ForegroundColor Red
-    } else {
-        Write-Host "Se ha eliminado el usuario correctamente" -ForegroundColor Green
-    }
-}
+    #1.2 Crear carpeta para anonymous
+    #        New-Item -ItemType Junction -Path $rutaNuevoTunel -Target "$Ruta\$grupoDestino" -Force -Confirm:$false | Out-Null 
+    if (-not (Test-Path -Path "$Anonymous")) { New-Item -Path "$Anonymous" -ItemType Directory -Force | Out-Null} # eliminar
+    if (-not (Test-Path -Path "$RutaLocalUser\Public")) { New-Item -Path "$RutaLocalUser\Public" -ItemType Directory -Force | Out-Null }
+    if (-not (Test-Path -Path "$AnonymousJunction")) { New-Item -ItemType Junction -Path "$RutaLocalUser\Public\Publica" -Target "$CarpetaC" -Force | Out-Null }
 
-# ============================================================
-#  OPCION 9 — Consultar alumnos
-# ============================================================
-function consultarAlumnos {
-    Write-Host "`n--- Listado Oficial de Alumnos (FTP) ---" -ForegroundColor Cyan
-    $lista = Get-LocalUser | Where-Object { $_.Description -eq "Alumno" }
-    if ($lista) {
-        $lista | Select-Object Name, Description, Enabled | Format-Table -AutoSize
-    } else {
-        Write-Host "No hay alumnos registrados." -ForegroundColor Yellow
-    }
-}
+    # 2. ¡EL PASO CLAVE! Restaurar permisos a la normalidad para que IIS no se trabe por pruebas anteriores
+    icacls $Ruta /reset /T /C /Q > $null 2>&1
+    if (Test-Path "$Ruta\web.config") { Remove-Item "$Ruta\web.config" -Force -ErrorAction SilentlyContinue }
 
-# ============================================================
-#  OPCION 10 — Crear grupo academico  (funcion original de power_fun_par.ps1)
-# ============================================================
-# (ya definida arriba como crearGrupo, se llama directamente en el switch)
+    Write-Host "Configurando el servicio IIS y FTP..." -ForegroundColor Cyan
 
-# ============================================================
-#  OPCION 11 — Eliminar grupo academico
-# ============================================================
-function deleteGroup {
-    param ([string]$nombre, [string]$descripcion)
-    $nombre = $nombre.Trim()
+    # 3. Creación de grupos
+    $gruposNecesarios = @(
+        @{Name="Alumnos"; Desc="Identificador Alumnos"},
+        @{Name="Reprobados"; Desc="Grupo Academico"},
+        @{Name="Recursadores"; Desc="Grupo Academico"}
+    )
 
-    if ($script:gruposSistema -contains $nombre) {
-        Write-Host "Se ha detectado que el grupo es un grupo del sistema" -ForegroundColor Red
-        return
-    }
-
-    $grp = Get-LocalGroup -Name $nombre -ErrorAction SilentlyContinue |
-           Where-Object { $_.Description -eq $descripcion }
-
-    if ($null -eq $grp) {
-        Write-Host "No se encontro un grupo llamado '$nombre' con la descripcion '$descripcion'" -ForegroundColor Yellow
-        return
-    }
-
-    Write-Host "Limpiando carpetas de usuarios miembros de '$nombre'..." -ForegroundColor Cyan
-    $miembros = Get-LocalGroupMember -Group $nombre -ErrorAction SilentlyContinue
-    foreach ($m in $miembros) {
-        $mNombre     = $m.Name.Split('\')[-1]
-        $rutaJuncion = "C:\FTP\LocalUser\$mNombre\$nombre"
-        if (Test-Path $rutaJuncion) {
-            Remove-Item -Path $rutaJuncion -Recurse -Force -Confirm:$false | Out-Null
+    foreach ($grupo in $gruposNecesarios) {
+        if (-not (Get-LocalGroup -Name $grupo.Name -ErrorAction SilentlyContinue)) {
+            New-LocalGroup -Name $grupo.Name -Description $grupo.Desc | Out-Null
+            Write-Host "Grupo '$($grupo.Name)' creado." -ForegroundColor Yellow
         }
     }
+    # 4. Creación del sitio FTP en IIS
+    Import-Module WebAdministration
+    New-WebFtpSite -Name $Name -Port 21 -PhysicalPath $Ruta -Force | Out-Null
 
-    if (Test-Path "C:\FTP\$nombre") {
-        Remove-Item -Path "C:\FTP\$nombre" -Recurse -Force -Confirm:$false | Out-Null
+    # 5. Configuración de Autenticación y SSL
+    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.authentication.anonymousAuthentication.enabled" -Value $true > $null 2>&1
+    Set-ItemProperty "IIS:\Sites\$Name" -Name "ftpServer.security.authentication.basicAuthentication.enabled" -Value $true > $null 2>&1
+    Set-ItemProperty -Path "IIS:\Sites\$Name" -Name "ftpServer.userIsolation.mode" -Value "IsolateAllDirectories" > $null 2>&1
+
+    $Cert = New-SelfSignedCertificate -DnsName "MiServidorFTP" -CertStoreLocation "cert:\LocalMachine\My"
+    Set-ItemProperty -Path "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.serverCertHash" -Value $Cert.Thumbprint > $null 2>&1
+    Set-ItemProperty -Path "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.controlChannelPolicy" -Value "SslRequire" > $null 2>&1
+    Set-ItemProperty -Path "IIS:\Sites\$Name" -Name "ftpServer.security.ssl.dataChannelPolicy" -Value "SslRequire" > $null 2>&1
+
+    # 6. Firewall
+    if ((Get-NetFirewallRule -Name "Regla_FTP_In" -ErrorAction SilentlyContinue) -eq $null) {
+        New-NetFirewallRule -Name "Regla_FTP_In" -DisplayName "Permitir FTP (Puerto 21)" -Direction Inbound -Protocol TCP -LocalPort 21 -Action Allow > $null 2>&1
     }
 
-    Remove-LocalGroup -Name $nombre
+    Write-Host "Aplicando reglas de autorizacion de IIS..." -ForegroundColor Cyan
 
-    if ($null -ne (Get-LocalGroup -Name $nombre -ErrorAction SilentlyContinue)) {
-        Write-Host "No se ha eliminado el grupo correctamente" -ForegroundColor Red
-    } else {
-        Write-Host "Se ha eliminado el grupo '$nombre' y sus subcarpetas correctamente" -ForegroundColor Green
-    }
+    # 7. Reglas de Autorización de IIS (Ahora se ejecutan sin error porque la carpeta no está bloqueada)
+    Clear-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name -ErrorAction SilentlyContinue
+    #Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name -Value @{accessType="Allow"; users="?"; permissions="Read"}
+# 2. Tu idea: DENEGAR explícitamente la escritura al usuario anónimo
+
+# 3. Permitir que Anonymous pueda al menos LEER
+Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name -Value @{accessType="Allow"; users="?"; permissions="Read"} > $null 2>&1
+
+# 4. Permitir a todos los demás (usuarios autenticados) Leer y Escribir
+
+    Add-WebConfiguration -Filter /system.ftpServer/security/authorization -PSPath "IIS:\" -Location $Name -Value @{accessType="Allow"; roles="Alumnos"; permissions="Read, Write"} > $null 2>&1
+
+    
+    Write-Host "Aplicando candados de seguridad NTFS..." -ForegroundColor Cyan
+ 
+
+    # ─── $Ruta : deshabilitar herencia y permisos base ──────────────────────────
+    $acl = Get-Acl -Path $Ruta
+    $acl.SetAccessRuleProtection($true, $false)   # /inheritance:r
+    Set-Acl -Path $Ruta -AclObject $acl
+
+    Set-NtfsRule $Ruta "Administrators"       "FullControl"
+    Set-NtfsRule $Ruta "SYSTEM"              "FullControl"
+    Set-NtfsRule $Ruta "IIS_IUSRS"           "ReadAndExecute"
+    Set-NtfsRule $Ruta "IUSR"               "ReadAndExecute"
+    Set-NtfsRule $Ruta "Authenticated Users" "ReadAndExecute"
+
+    # ─── $RutaLocalUser ─────────────────────────────────────────────────────────
+    Set-NtfsRule $RutaLocalUser "Authenticated Users" "ReadAndExecute"
+    Set-NtfsRule $RutaLocalUser "IUSR"               "ReadAndExecute"
+
+    # ─── $Anonymous y $AnonymousJunction (/T = recursivo) ───────────────────────
+    Get-ChildItem -Path $Anonymous        -Recurse -Force | ForEach-Object { Set-NtfsRule $_.FullName "IUSR" "ReadAndExecute" }
+    Set-NtfsRule $Anonymous        "IUSR" "ReadAndExecute"
+    Get-ChildItem -Path $AnonymousJunction -Recurse -Force | ForEach-Object { Set-NtfsRule $_.FullName "IUSR" "ReadAndExecute" }
+    Set-NtfsRule $AnonymousJunction "IUSR" "ReadAndExecute"
+
+    Set-NtfsRule "$RutaLocalUser\Public"         "IUSR" "ReadAndExecute"
+    Set-NtfsRule "$RutaLocalUser\Public\Publica" "IUSR" "ReadAndExecute"
+
+    # ─── $CarpetaA  (Reprobados:M, denegar Recursadores y IUSR) ─────────────────
+    $acl = Get-Acl $CarpetaA; $acl.SetAccessRuleProtection($true,$false); Set-Acl $CarpetaA $acl
+    Set-NtfsRule $CarpetaA "Administrators" "FullControl"
+    Set-NtfsRule $CarpetaA "SYSTEM"        "FullControl"
+    Set-NtfsRule $CarpetaA "Reprobados"    "Modify"
+    Set-NtfsRule $CarpetaA "Recursadores"  "FullControl" -Type "Deny"
+    Set-NtfsRule $CarpetaA "IUSR"         "FullControl" -Type "Deny"
+
+    # ─── $CarpetaB  (Recursadores:M, denegar Reprobados y IUSR) ─────────────────
+    $acl = Get-Acl $CarpetaB; $acl.SetAccessRuleProtection($true,$false); Set-Acl $CarpetaB $acl
+    Set-NtfsRule $CarpetaB "Administrators" "FullControl"
+    Set-NtfsRule $CarpetaB "SYSTEM"        "FullControl"
+    Set-NtfsRule $CarpetaB "Recursadores"  "Modify"
+    Set-NtfsRule $CarpetaB "Reprobados"    "FullControl" -Type "Deny"
+    Set-NtfsRule $CarpetaB "IUSR"         "FullControl" -Type "Deny"
+
+    # ─── $CarpetaC  (Authenticated Users:M, IUSR:R) ─────────────────────────────
+    $acl = Get-Acl $CarpetaC; $acl.SetAccessRuleProtection($true,$false); Set-Acl $CarpetaC $acl
+    Set-NtfsRule $CarpetaC "Administrators"      "FullControl"
+    Set-NtfsRule $CarpetaC "SYSTEM"             "FullControl"
+    Set-NtfsRule $CarpetaC "IUSR"              "ReadAndExecute"
+    Set-NtfsRule $CarpetaC "Authenticated Users" "Modify"
+
+    Restart-WebItem "IIS:\Sites\$Name"
+    Write-Host "Configuracion completada con exito." -ForegroundColor Green
 }
 
-# ============================================================
-#  OPCION 12 — Consultar grupos academicos
-# ============================================================
-function consultarGrupos {
-    Write-Host "`n--- Grupos Academicos del Servidor ---" -ForegroundColor Cyan
-    $lista = Get-LocalGroup | Where-Object { $_.Description -eq "Grupo Academico" }
-    if ($lista) {
-        $lista | Select-Object Name, Description | Format-Table -AutoSize
-    } else {
-        Write-Host "No hay grupos academicos registrados." -ForegroundColor Yellow
-    }
+function monitoreo {
+	$aux = Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
+
+	if ($aux -eq $null) {
+		Write-Host "Se ha detectado que no se tiene instalado el DNS Server" -Foregroundcolor "red"
+	} else {
+        Write-Host "`n=== Estado del servicio ===" -ForegroundColor $color
+        Get-Service -Name "FTPSVC" -ErrorAction SilentlyContinue | ft -Autosize
+    } 
 }
 
-# ============================================================
-# ============================================================
-#  MODO INTERACTIVO — ciclo continuo si no se pasa -option
-# ============================================================
-if ([string]::IsNullOrWhiteSpace($option)) {
-    do {
-        # Resetear variables en cada iteracion
-        $users = ""; $passwords = ""; $groups = ""; $no_users = 0
-        $install = $false; $confirm = $false
-
-        Write-Host "`n╔══════════════════════════════════════╗" -ForegroundColor Cyan
-        Write-Host "║       ADMINISTRADOR SERVIDOR FTP     ║" -ForegroundColor Cyan
-        Write-Host "╚══════════════════════════════════════╝" -ForegroundColor Cyan
-        Write-Host ""
-        Write-Host "  --- Servicio ---" -ForegroundColor Yellow
-        Write-Host "  1)  Verificar servicio FTP"
-        Write-Host "  2)  Instalar servicio FTP"
-        Write-Host "  3)  Configuracion inicial (ejecutar tras instalar)"
-        Write-Host "  4)  Desinstalar servicio FTP"
-        Write-Host "  5)  Estatus del servicio"
-        Write-Host ""
-        Write-Host "  --- Usuarios ---" -ForegroundColor Yellow
-        Write-Host "  6)  Mover usuario a un grupo"
-        Write-Host "  7)  Agregar alumno(s)"
-        Write-Host "  8)  Eliminar alumno"
-        Write-Host "  9)  Consultar alumnos"
-        Write-Host ""
-        Write-Host "  --- Grupos ---" -ForegroundColor Yellow
-        Write-Host "  10) Agregar grupo academico"
-        Write-Host "  11) Eliminar grupo academico"
-        Write-Host "  12) Consultar grupos academicos"
-        Write-Host ""
-        Write-Host "  0)  Salir" -ForegroundColor Red
-        Write-Host ""
-
-        $opMenu = (Read-Host "  Selecciona una opcion").Trim()
-
-        if ($opMenu -eq "0") {
-            Write-Host "`nHasta luego." -ForegroundColor Cyan
-            exit 0
-        }
-
-        # Pedir parametros adicionales segun la opcion
-        switch ($opMenu) {
-            "2"  { $install = $true }
-            "4"  { $confirm = $true }
-            "6"  {
-                $users  = (Read-Host "  Nombre del usuario a mover").Trim()
-                consultarGrupos
-                $groups = (Read-Host "  Nombre del grupo destino").Trim()
-            }
-            "7"  {
-                $no_users  = [int](Read-Host "  Cuantos alumnos deseas registrar")
-                $users     = (Read-Host "  Nombres separados por coma (ej: juan,ana)").Trim()
-                $passwords = (Read-Host "  Contrasenas separadas por coma (ej: Pass1!,Pass2!)").Trim()
-            }
-            "8"  {
-                consultarAlumnos
-                $users = (Read-Host "  Nombre del alumno a eliminar").Trim()
-            }
-            "10" { $groups = (Read-Host "  Nombre del nuevo grupo academico").Trim() }
-            "11" {
-                consultarGrupos
-                $groups = (Read-Host "  Nombre del grupo a eliminar").Trim()
-            }
-        }
-
-        # Ejecutar la opcion elegida
-        switch ($opMenu) {
-            "1"  { checkService }
-            "2"  { installService }
-            "3"  { configureService }
-            "4"  { uninstallService }
-            "5"  { monitoreo }
-            "6"  { changeGroup -usuario $users -grupoDestino $groups }
-            "7"  { crearAlumno }
-            "8"  { deleteUser -nombre $users }
-            "9"  { consultarAlumnos }
-            "10" { crearGrupo  -nombreGrupo $groups -descripcion "Grupo Academico" }
-            "11" { deleteGroup -nombre $groups -descripcion "Grupo Academico" }
-            "12" { consultarGrupos }
-            default { Write-Host "Opcion invalida, intenta de nuevo." -ForegroundColor Red }
-        }
-
-        Write-Host ""
-        Read-Host "  Presiona Enter para continuar"
-
-    } while ($true)
-}
-
-# ============================================================
-#  MODO PARAMETROS — ejecucion directa con -option
-# ============================================================
 switch ($option) {
-    "1"  { checkService;                                                    break }
-    "2"  { installService;                                                  break }
-    "3"  { configureService;                                                break }
-    "4"  { uninstallService;                                                break }
-    "5"  { monitoreo;                                                       break }
-    "6"  { changeGroup -usuario $users -grupoDestino $groups;               break }
-    "7"  { crearAlumno;                                                     break }
-    "8"  { deleteUser -nombre $users;                                       break }
-    "9"  { consultarAlumnos;                                                break }
-    "10" { crearGrupo  -nombreGrupo $groups -descripcion "Grupo Academico"; break }
-    "11" { deleteGroup -nombre $groups -descripcion "Grupo Academico";      break }
-    "12" { consultarGrupos;                                                 break }
-    default {
-        Write-Host "Se ha detectado una opcion invalida, vuelve a intentarlo" -ForegroundColor Red
-    }
+    "1" {checkService; break;}
+	"2" {installService; break;}
+	"3" {configureService; break;}
+	"4" {uninstallService; break;}
+    "5" {monitoreo; break;}
+    "6" {changeGroup -usuario $users -grupoDestino $groups; break;}
+    "7" {crearAlumno -descripcion "Alumno"; break;}
+    "8" {deleteUser -nombre "$users" -descripcion "Alumno"; break;}
+    "9" {consultarAlumnos; break;}
+    "10" {crearGrupo -nombreGrupo "$groups" -descripcion "Grupo Academico"; break;}
+    "11" {deleteGroup -nombre "$groups" -descripcion "Grupo Academico"; break;}
+    "12" {consultarGrupos; break;}
+	default {Write-Host "Se ha detectado una opcion invalida, vuelve a intentarlo" -Foregroundcolor red}
 }
