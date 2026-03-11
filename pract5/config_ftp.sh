@@ -73,8 +73,52 @@ function instalar_configurar() {
     chmod 2755 "$ANON_ROOT/general"
 
     # Asegurar que archivos ya existentes en /general sean legibles por otros
-    find "$FTP_ROOT/general" -type f  -exec chmod o+r {} \;
+    find "$FTP_ROOT/general" -type f  -exec chmod o+r  {} \;
     find "$FTP_ROOT/general" -type d  -exec chmod o+rx {} \;
+
+    # -------------------------------------------------------
+    # VIGILANTE DE PERMISOS EN TIEMPO REAL
+    # Corrige permisos automáticamente cuando un usuario sube
+    # archivos o crea carpetas dentro de /srv/ftp/general
+    # -------------------------------------------------------
+    rpm -q inotify-tools &>/dev/null || zypper install -y inotify-tools
+
+    cat > /usr/local/bin/ftp_fix_perms.sh <<'WATCHER'
+#!/bin/bash
+# Vigila /srv/ftp/general y aplica o+rX a todo lo nuevo
+TARGET="/srv/ftp/general"
+inotifywait -m -r -e create -e moved_to --format '%w%f' "$TARGET" | \
+while read path; do
+    if [ -d "$path" ]; then
+        chmod o+rx "$path"
+    elif [ -f "$path" ]; then
+        chmod o+r "$path"
+    fi
+done
+WATCHER
+    chmod +x /usr/local/bin/ftp_fix_perms.sh
+
+    # Servicio systemd para el vigilante
+    cat > /etc/systemd/system/ftp-fix-perms.service <<'SVC'
+[Unit]
+Description=FTP general folder permission watcher
+After=vsftpd.service
+
+[Service]
+ExecStart=/usr/local/bin/ftp_fix_perms.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+    systemctl daemon-reload
+    systemctl enable --now ftp-fix-perms.service
+
+    # Cronjob de respaldo: cada minuto corrige todo /general por si acaso
+    echo "* * * * * root find $FTP_ROOT/general -type f -exec chmod o+r {} \\; && find $FTP_ROOT/general -type d -exec chmod o+rx {} \\;" \
+        > /etc/cron.d/ftp_perms
 
     # -------------------------------------------------------
     # CONFIGURACIÓN VSFTPD.CONF
@@ -291,6 +335,14 @@ function borrar_todo() {
     echo "Limpiando sistema..."
 
     systemctl stop vsftpd
+
+    # --- Detener y eliminar servicio vigilante de permisos ---
+    systemctl stop  ftp-fix-perms.service 2>/dev/null
+    systemctl disable ftp-fix-perms.service 2>/dev/null
+    rm -f /etc/systemd/system/ftp-fix-perms.service
+    rm -f /usr/local/bin/ftp_fix_perms.sh
+    rm -f /etc/cron.d/ftp_perms
+    systemctl daemon-reload
 
     # --- Desmontar bind mount anónimo ---
     if mountpoint -q "$ANON_ROOT/general"; then
