@@ -2,7 +2,7 @@
 # =================================================================
 # SCRIPT FTP - OpenSUSE LEAP - vsftpd
 # Grupos: reprobados / recursadores
-# Acceso anónimo: solo lectura en /general
+# Acceso anónimo: solo lectura en /general (chroot en /srv/ftp/anon)
 # Acceso autenticado: escritura en /general, grupo y personal
 # =================================================================
 
@@ -10,6 +10,7 @@
 
 # --- RUTAS Y VARIABLES GLOBALES ---
 FTP_ROOT="/srv/ftp"
+ANON_ROOT="$FTP_ROOT/anon"
 USERS_HOME="/home/ftp_users"
 GRUPOS=("reprobados" "recursadores")
 
@@ -37,17 +38,34 @@ function instalar_configurar() {
     mkdir -p "$FTP_ROOT/recursadores"
 
     # /general → grupo 'ftp', todos los usuarios autenticados escriben
-    # chmod 2775: SGID (hereda grupo) rwxrwxr-x — usuarios del grupo escriben en /general
+    # chmod 2775: SGID (hereda grupo) rwxrwxr-x
     chown root:ftp "$FTP_ROOT/general"
     chmod 2775 "$FTP_ROOT/general"
 
     # /reprobados y /recursadores → solo su grupo escribe
-    # chmod 2770: SGID rwxrwx--- — miembros del grupo pueden crear, editar y borrar archivos
+    # chmod 2770: SGID rwxrwx---
     chown root:reprobados "$FTP_ROOT/reprobados"
     chmod 2770 "$FTP_ROOT/reprobados"
 
     chown root:recursadores "$FTP_ROOT/recursadores"
     chmod 2770 "$FTP_ROOT/recursadores"
+
+    # -------------------------------------------------------
+    # ESTRUCTURA PARA ACCESO ANÓNIMO
+    # /srv/ftp/anon/         ← raíz chroot (no escribible, solo root)
+    # /srv/ftp/anon/general/ ← bind mount de /srv/ftp/general
+    # -------------------------------------------------------
+    mkdir -p "$ANON_ROOT"
+    chown root:root "$ANON_ROOT"
+    chmod 755 "$ANON_ROOT"
+
+    mkdir -p "$ANON_ROOT/general"
+    mountpoint -q "$ANON_ROOT/general" || \
+        mount --bind "$FTP_ROOT/general" "$ANON_ROOT/general"
+
+    # Persistencia en fstab
+    grep -q "$ANON_ROOT/general" /etc/fstab || \
+        echo "$FTP_ROOT/general $ANON_ROOT/general none bind 0 0" >> /etc/fstab
 
     # -------------------------------------------------------
     # CONFIGURACIÓN VSFTPD.CONF
@@ -57,9 +75,9 @@ function instalar_configurar() {
 listen=YES
 listen_ipv6=NO
 
-# --- Acceso anónimo (solo lectura a /general) ---
+# --- Acceso anónimo (solo lectura, chroot en $ANON_ROOT) ---
 anonymous_enable=YES
-anon_root=$FTP_ROOT/general
+anon_root=$ANON_ROOT
 no_anon_password=YES
 anon_upload_enable=NO
 anon_mkdir_write_enable=NO
@@ -89,9 +107,9 @@ pasv_max_port=40100
 EOF
 
     # Firewall
-    firewall-cmd --permanent --add-service=ftp       &>/dev/null
+    firewall-cmd --permanent --add-service=ftp          &>/dev/null
     firewall-cmd --permanent --add-port=40000-40100/tcp &>/dev/null
-    firewall-cmd --reload                              &>/dev/null
+    firewall-cmd --reload                                &>/dev/null
 
     systemctl enable vsftpd
     systemctl restart vsftpd
@@ -99,6 +117,7 @@ EOF
     echo ""
     echo "vsftpd configurado y activo."
     echo "Carpetas maestras listas en $FTP_ROOT"
+    echo "Raíz anónima: $ANON_ROOT (bind mount de $FTP_ROOT/general en $ANON_ROOT/general)"
 }
 
 # =================================================================
@@ -264,14 +283,26 @@ function borrar_todo() {
 
     systemctl stop vsftpd
 
-    # Desmontar todos los bind mounts activos
-    mount | grep "$USERS_HOME" | awk '{print $3}' | \
-        xargs -I{} umount -l {} 2>/dev/null
+    # --- Desmontar bind mount anónimo ---
+    if mountpoint -q "$ANON_ROOT/general"; then
+        fuser -km "$ANON_ROOT/general" 2>/dev/null
+        sleep 1
+        umount "$ANON_ROOT/general" 2>/dev/null || umount -l "$ANON_ROOT/general" 2>/dev/null
+    fi
+    sed -i "\|$ANON_ROOT/general|d" /etc/fstab
 
-    # Limpiar fstab
+    # --- Desmontar todos los bind mounts de usuarios ---
+    mount | grep "$USERS_HOME" | awk '{print $3}' | sort -r | \
+        while read mnt; do
+            fuser -km "$mnt" 2>/dev/null
+            sleep 1
+            umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null
+        done
+
+    # Limpiar entradas de usuarios en fstab
     sed -i "\|$USERS_HOME|d" /etc/fstab
 
-    # Eliminar usuarios FTP
+    # --- Eliminar usuarios FTP ---
     getent passwd | awk -F: '$3 >= 1000 && $6 ~ /ftp_users/ {print $1}' | \
     while read user; do
         grp=$(id -gn "$user" 2>/dev/null)
@@ -281,7 +312,7 @@ function borrar_todo() {
         fi
     done
 
-    # Eliminar directorios y grupos
+    # --- Eliminar directorios y grupos ---
     rm -rf "$USERS_HOME" "$FTP_ROOT"
     groupdel reprobados   2>/dev/null
     groupdel recursadores 2>/dev/null
