@@ -67,6 +67,15 @@ function instalar_configurar() {
     grep -q "$ANON_ROOT/general" /etc/fstab || \
         echo "$FTP_ROOT/general $ANON_ROOT/general none bind 0 0" >> /etc/fstab
 
+    # El anónimo corre como usuario 'ftp' (otros) → necesita r-x en el directorio
+    # y r-- en los archivos. 2755 = SGID + rwxr-xr-x
+    chown root:ftp "$ANON_ROOT/general"
+    chmod 2755 "$ANON_ROOT/general"
+
+    # Asegurar que archivos ya existentes en /general sean legibles por otros
+    find "$FTP_ROOT/general" -type f  -exec chmod o+r {} \;
+    find "$FTP_ROOT/general" -type d  -exec chmod o+rx {} \;
+
     # -------------------------------------------------------
     # CONFIGURACIÓN VSFTPD.CONF
     # -------------------------------------------------------
@@ -85,8 +94,8 @@ anon_mkdir_write_enable=NO
 # --- Usuarios locales autenticados ---
 local_enable=YES
 write_enable=YES
-local_umask=002
-file_open_mode=0664
+local_umask=022
+file_open_mode=0644
 
 # --- Chroot: cada usuario ve solo su HOME ---
 chroot_local_user=YES
