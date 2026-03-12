@@ -42,6 +42,10 @@ function instalar_configurar() {
     chown root:ftp "$FTP_ROOT/general"
     chmod 2775 "$FTP_ROOT/general"
 
+    # Marcar /srv/ftp/general como shared para que los rename
+    # dentro de bind mounts funcionen correctamente
+    mount --make-shared "$FTP_ROOT/general" 2>/dev/null || true
+
     # /reprobados y /recursadores → solo su grupo escribe
     # chmod 2770: SGID rwxrwx---
     chown root:reprobados "$FTP_ROOT/reprobados"
@@ -60,8 +64,10 @@ function instalar_configurar() {
     chmod 755 "$ANON_ROOT"
 
     mkdir -p "$ANON_ROOT/general"
-    mountpoint -q "$ANON_ROOT/general" || \
+    if ! mountpoint -q "$ANON_ROOT/general"; then
         mount --bind "$FTP_ROOT/general" "$ANON_ROOT/general"
+        mount --make-slave "$ANON_ROOT/general"
+    fi
 
     # Persistencia en fstab
     grep -q "$ANON_ROOT/general" /etc/fstab || \
@@ -145,6 +151,10 @@ file_open_mode=0644
 chroot_local_user=YES
 allow_writeable_chroot=YES
 
+# --- Permitir renombrar/mover archivos y carpetas ---
+# Necesario para que FileZilla pueda mover subcarpetas a la raíz
+rename_enable=YES
+
 # --- Seguridad y logs ---
 dirmessage_enable=YES
 use_localtime=YES
@@ -214,11 +224,17 @@ function crear_usuarios() {
         mkdir -p "$user_home/$username"
 
         # --- BIND MOUNTS: conectar vistas del usuario con el almacén real ---
-        mountpoint -q "$user_home/general" || \
+        # Se usa --make-slave para que los rename dentro del mount funcionen
+        # correctamente sin propagar cambios de vuelta al master
+        if ! mountpoint -q "$user_home/general"; then
             mount --bind "$FTP_ROOT/general" "$user_home/general"
+            mount --make-slave "$user_home/general"
+        fi
 
-        mountpoint -q "$user_home/$grupo" || \
+        if ! mountpoint -q "$user_home/$grupo"; then
             mount --bind "$FTP_ROOT/$grupo" "$user_home/$grupo"
+            mount --make-slave "$user_home/$grupo"
+        fi
 
         # Persistencia en fstab (sobrevive reinicios)
         grep -q "$user_home/general" /etc/fstab || \
@@ -290,6 +306,7 @@ function cambiar_grupo() {
     # 3. Crear y montar carpeta del nuevo grupo
     mkdir -p "$user_home/$nuevo_grupo"
     mount --bind "$FTP_ROOT/$nuevo_grupo" "$user_home/$nuevo_grupo"
+    mount --make-slave "$user_home/$nuevo_grupo"
 
     if ! mountpoint -q "$user_home/$nuevo_grupo"; then
         echo "ERROR: No se pudo montar '$nuevo_grupo'."
