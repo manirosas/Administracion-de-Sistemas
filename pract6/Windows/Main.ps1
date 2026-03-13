@@ -1,4 +1,13 @@
 #Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Sistema de Aprovisionamiento Web - Windows Server
+    Gestiona IIS, Apache para Windows y Nginx para Windows.
+.DESCRIPTION
+    Equivalente Windows del script main.sh para openSUSE.
+    Requiere: PowerShell 5.1+, Windows Server 2016+ o Windows 10+
+    Ejecutar como Administrador: powershell -ExecutionPolicy Bypass -File main.ps1
+#>
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -13,9 +22,10 @@ $ESTADO_APACHE = "$ESTADO_DIR\apache.conf"
 $ESTADO_NGINX  = "$ESTADO_DIR\nginx.conf"
 
 # Rutas de instalacion
-$APACHE_DIR = "C:\Apache24"
+$APACHE_DIR = "$env:APPDATA\Apache24"
 $NGINX_DIR  = "C:\nginx"
 $IIS_SITE   = "Default Web Site"
+$APACHE_SVC = "Apache"   # Nombre real del servicio Chocolatey
 
 # Puertos reservados (no permitidos)
 $PUERTOS_RESERVADOS = @(20,21,22,23,25,53,110,143,389,443,445,3306,5432,6379,8443,27017)
@@ -215,11 +225,12 @@ function Crear-Index-Html($directorio, $servicio, $version, $puerto) {
 function Obtener-Versiones-Choco($paquete) {
     if (-not (Verificar-Chocolatey)) { return @() }
     try {
-        # choco info --all lista todas las versiones disponibles
-        $salida = choco info $paquete --all --limit-output 2>$null
-        $versiones = $salida | Where-Object { $_ -match "^\S+\|(\S+)" } |
+        # choco search --all-versions lista todas las versiones disponibles
+        $salida = choco search $paquete --all-versions --limit-output 2>$null
+        if ($null -eq $salida) { return @() }
+        $versiones = @($salida | Where-Object { $_ -match "^\S+\|\S+" } |
                      ForEach-Object { ($_ -split '\|')[1] } |
-                     Select-Object -Unique
+                     Select-Object -Unique)
         return $versiones
     } catch { return @() }
 }
@@ -228,8 +239,9 @@ function Obtener-Versiones-Winget($paquete) {
     if (-not (Verificar-Winget)) { return @() }
     try {
         $salida = winget show --id $paquete --versions 2>$null
-        $versiones = $salida | Where-Object { $_ -match '^\s*[\d.]' } |
-                     ForEach-Object { $_.Trim() }
+        if ($null -eq $salida) { return @() }
+        $versiones = @($salida | Where-Object { $_ -match '^\s*[\d.]' } |
+                     ForEach-Object { $_.Trim() })
         return $versiones
     } catch { return @() }
 }
@@ -237,7 +249,9 @@ function Obtener-Versiones-Winget($paquete) {
 function Seleccionar-Version-Choco($paquete) {
     Write-Host ""
     Write-Host "  Consultando versiones disponibles en Chocolatey para '$paquete'..."
-    $versiones = Obtener-Versiones-Choco $paquete
+
+    # Forzar array para evitar problemas con $null en PS 5.1
+    $versiones = @(Obtener-Versiones-Choco $paquete)
 
     if ($versiones.Count -eq 0) {
         Write-Host "  AVISO: No se encontraron versiones. Se instalara la version por defecto."
@@ -277,7 +291,7 @@ function Menu-Principal {
     Write-Host ""
     Write-Host "  Estado de servicios:"
     Write-Host ("    {0,-10} estado: {1,-14} puerto: {2}" -f "IIS",    (Estado-Servicio "W3SVC"),        (Leer-Puerto $ESTADO_IIS    "80"))
-    Write-Host ("    {0,-10} estado: {1,-14} puerto: {2}" -f "Apache", (Estado-Servicio "Apache2.4"),    (Leer-Puerto $ESTADO_APACHE "8081"))
+    Write-Host ("    {0,-10} estado: {1,-14} puerto: {2}" -f "Apache", (Estado-Servicio "Apache"),    (Leer-Puerto $ESTADO_APACHE "8081"))
     Write-Host ("    {0,-10} estado: {1,-14} puerto: {2}" -f "Nginx",  (Estado-Servicio "nginx"),        (Leer-Puerto $ESTADO_NGINX  "8082"))
     Write-Host ""
     Write-Linea
@@ -553,7 +567,7 @@ function Instalar-Apache {
         Instalar-Chocolatey
     }
 
-    if (Servicio-Instalado "Apache2.4") {
+    if (Servicio-Instalado "Apache") {
         Write-Host "  Apache ya esta instalado."
         $resp = Read-Host "  Desea reconfigurar? [s/N]"
         if ($resp -notmatch '^[sS]$') { return }
@@ -567,16 +581,17 @@ function Instalar-Apache {
     Write-Host "  Defina el puerto de escucha para Apache:"
     $puerto = Pedir-Puerto "8081" ""
 
-    # Instalar
+    # Instalar - pasar puerto como parametro para evitar conflicto con puerto 8080 por defecto
+    $chocoParams = "/Port:$puerto"
     if ($version -eq "default") {
-        Write-Host "  Instalando Apache Win64 (version por defecto)..."
-        choco install apache-httpd -y --no-progress 2>&1 | Tee-Object -Variable chocoOut
+        Write-Host "  Instalando Apache Win64 (version por defecto) en puerto $puerto..."
+        choco install apache-httpd -y --no-progress --force --params $chocoParams 2>&1 | Tee-Object -Variable chocoOut
     } else {
-        Write-Host "  Instalando Apache Win64 version $version..."
-        choco install apache-httpd --version $version -y --no-progress 2>&1 | Tee-Object -Variable chocoOut
+        Write-Host "  Instalando Apache Win64 version $version en puerto $puerto..."
+        choco install apache-httpd --version $version -y --no-progress --force --params $chocoParams 2>&1 | Tee-Object -Variable chocoOut
         if ($LASTEXITCODE -ne 0) {
             Write-Host "  AVISO: No se pudo instalar la version $version. Instalando por defecto..."
-            choco install apache-httpd -y --no-progress
+            choco install apache-httpd -y --no-progress --force --params $chocoParams
         }
     }
 
@@ -663,7 +678,7 @@ function Instalar-Apache {
     Crear-Index-Html $webRoot "Apache Win64" $verReal $puerto
 
     # --- Registrar como servicio de Windows ---
-    if (-not (Servicio-Instalado "Apache2.4")) {
+    if (-not (Servicio-Instalado "Apache")) {
         & "$APACHE_DIR\bin\httpd.exe" -k install 2>$null
         Write-Host "  Apache registrado como servicio de Windows."
     }
@@ -673,13 +688,13 @@ function Instalar-Apache {
     Guardar-Puerto $ESTADO_APACHE $puerto
 
     # --- Iniciar ---
-    Start-Service "Apache2.4" -ErrorAction SilentlyContinue
-    $estado = Estado-Servicio "Apache2.4"
+    Start-Service "Apache" -ErrorAction SilentlyContinue
+    $estado = Estado-Servicio "Apache"
     Write-Host "  Apache: $estado en puerto $puerto."
 
     Write-Host ""
     Write-Host "  Instalacion completada."
-    Write-Host "  Servicio : Apache2.4"
+    Write-Host "  Servicio : Apache"
     Write-Host "  Version  : $verReal"
     Write-Host "  Puerto   : $puerto"
     Write-Host "  Web root : $webRoot"
@@ -785,7 +800,8 @@ http {
     Crear-Index-Html $webRoot "Nginx Windows" $verReal $puerto
 
     # --- Registrar como servicio (usando NSSM o sc) ---
-    $nssmPath = (Get-Command nssm -ErrorAction SilentlyContinue)?.Source
+    $nssmCmd = Get-Command nssm -ErrorAction SilentlyContinue
+    $nssmPath = if ($nssmCmd) { $nssmCmd.Source } else { $null }
     if ($nssmPath) {
         nssm install nginx "$NGINX_DIR\nginx.exe" 2>$null
         nssm set nginx AppDirectory $NGINX_DIR 2>$null
@@ -880,7 +896,7 @@ function Cambiar-Puerto-IIS {
 function Cambiar-Puerto-Apache {
     Write-Titulo "Cambiar Puerto - Apache Win64"
 
-    if (-not (Servicio-Instalado "Apache2.4")) {
+    if (-not (Servicio-Instalado "Apache")) {
         Write-Host "  ERROR: Apache no esta instalado."
         Pausar; return
     }
@@ -912,7 +928,7 @@ function Cambiar-Puerto-Apache {
     Firewall-Abrir-Puerto  $np "Apache"
     Guardar-Puerto $ESTADO_APACHE $np
 
-    Restart-Service "Apache2.4" -ErrorAction SilentlyContinue
+    Restart-Service "Apache" -ErrorAction SilentlyContinue
     Write-Host "  Apache reiniciado en puerto $np."
     Pausar
 }
@@ -1001,7 +1017,7 @@ function Borrar-IIS {
 function Borrar-Apache {
     Write-Titulo "Borrar configuracion / Desinstalar Apache Win64"
 
-    if (-not (Servicio-Instalado "Apache2.4")) {
+    if (-not (Servicio-Instalado "Apache")) {
         Write-Host "  Apache no esta instalado."
         Pausar; return
     }
@@ -1012,8 +1028,8 @@ function Borrar-Apache {
 
     $p = Leer-Puerto $ESTADO_APACHE "8081"
 
-    Stop-Service    "Apache2.4" -ErrorAction SilentlyContinue
-    Disable-Service "Apache2.4" -ErrorAction SilentlyContinue
+    Stop-Service    "Apache" -ErrorAction SilentlyContinue
+    Disable-Service "Apache" -ErrorAction SilentlyContinue
 
     if (Verificar-Chocolatey) {
         choco uninstall apache-httpd -y --remove-dependencies 2>$null
