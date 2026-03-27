@@ -1,0 +1,194 @@
+
+$Global:DominioDN = "DC=dominio,DC=local"
+$Global:Dominio   = "dominio.local"
+$Global:HomesBase = "C:\Users\Homes"
+$Global:CsvPath = Join-Path $PSScriptRoot "usuarios.csv"
+
+
+
+function Invoke-Preparacion {
+
+    # Verificar que el archivo exista
+    if (-Not (Test-Path $Global:CsvPath)) {
+        Write-Host "ERROR: No se encontró usuarios.csv en $PSScriptRoot" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "CSV encontrado en $Global:CsvPath" -ForegroundColor Green
+
+    # Cargar y mostrar datos
+    $usuarios = Import-Csv $Global:CsvPath
+    $usuarios | Format-Table
+
+    # Mostrar rol del equipo
+    $rol = (Get-WmiObject Win32_ComputerSystem).DomainRole
+    Write-Host "DomainRole actual: $rol  (5 = DC listo)" -ForegroundColor Cyan
+}
+
+function Invoke-InstalarAD {
+    net user Administrator "Admin@12345!"
+    Install-WindowsFeature -Name AD-Domain-Services, GPMC, RSAT-AD-PowerShell, FS-Resource-Manager -IncludeManagementTools
+    Write-Host "Features instalados" -ForegroundColor Green
+    Import-Module ADDSDeployment
+    Install-ADDSForest `
+        -DomainName "dominio.local" -DomainNetbiosName "DOMINIO" `
+        -ForestMode "WinThreshold"  -DomainMode "WinThreshold" `
+        -InstallDns:$true `
+        -SafeModeAdministratorPassword (ConvertTo-SecureString "Admin@12345!" -AsPlainText -Force) `
+        -NoRebootOnCompletion:$false -Force:$true
+}
+
+function New-OUsYGrupos {
+    foreach ($ou in @("Cuates","NoCuates")) {
+        if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$ou'" -ErrorAction SilentlyContinue)) {
+            New-ADOrganizationalUnit -Name $ou -Path $Global:DominioDN -ProtectedFromAccidentalDeletion $false
+            Write-Host "OU creada: $ou" -ForegroundColor Green
+        } else { Write-Host "OU ya existe: $ou" -ForegroundColor Yellow }
+    }
+    New-ADGroup -Name "GrupoCuates"   -GroupScope Global -GroupCategory Security -Path "OU=Cuates,$Global:DominioDN"   -Description "Grupo 1 - Cuates 8AM-3PM"   -ErrorAction SilentlyContinue
+    New-ADGroup -Name "GrupoNoCuates" -GroupScope Global -GroupCategory Security -Path "OU=NoCuates,$Global:DominioDN" -Description "Grupo 2 - NoCuates 3PM-2AM" -ErrorAction SilentlyContinue
+    Write-Host "OUs y Grupos listos" -ForegroundColor Green
+}
+
+function New-ShareHomes {
+    New-Item -ItemType Directory -Path $Global:HomesBase -Force | Out-Null
+    if (-not (Get-SmbShare -Name "Homes" -ErrorAction SilentlyContinue)) {
+        New-SmbShare -Name "Homes" -Path $Global:HomesBase -FullAccess "DOMINIO\Domain Admins" -ChangeAccess "DOMINIO\Domain Users"
+        Write-Host "Share Homes creado" -ForegroundColor Green
+    } else { Write-Host "Share Homes ya existe" -ForegroundColor Yellow }
+}
+
+function New-UsuariosDesdeCSV {
+    param([array]$Usuarios)
+    foreach ($u in $Usuarios) {
+        $ouPath  = if ($u.Departamento -eq "Cuates") {"OU=Cuates,$Global:DominioDN"} else {"OU=NoCuates,$Global:DominioDN"}
+        $grupo   = if ($u.Departamento -eq "Cuates") {"GrupoCuates"} else {"GrupoNoCuates"}
+        $homeDir = "$Global:HomesBase\$($u.Usuario)"
+        if (-not (Test-Path $homeDir)) { New-Item -ItemType Directory -Path $homeDir | Out-Null }
+        if (-not (Get-ADUser -Filter "SamAccountName -eq '$($u.Usuario)'" -ErrorAction SilentlyContinue)) {
+            New-ADUser `
+                -Name "$($u.Nombre) $($u.Apellido)" -GivenName $u.Nombre -Surname $u.Apellido `
+                -SamAccountName $u.Usuario -UserPrincipalName "$($u.Usuario)@$Global:Dominio" `
+                -AccountPassword (ConvertTo-SecureString $u.Password -AsPlainText -Force) `
+                -Enabled $true -Path $ouPath -HomeDirectory $homeDir -HomeDrive "H:" -Department $u.Departamento
+            Write-Host "Usuario creado: $($u.Usuario) [$($u.Departamento)]" -ForegroundColor Green
+        } else { Write-Host "Usuario ya existe: $($u.Usuario)" -ForegroundColor Yellow }
+        Add-ADGroupMember -Identity $grupo -Members $u.Usuario -ErrorAction SilentlyContinue
+        $acl  = Get-Acl $homeDir
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("DOMINIO\$($u.Usuario)", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+        $acl.AddAccessRule($rule)
+        Set-Acl -Path $homeDir -AclObject $acl
+    }
+    Write-Host "Usuarios y permisos NTFS listos" -ForegroundColor Green
+}
+
+function Set-HorariosLogon {
+    param([array]$Usuarios)
+    function Get-LogonBytes ([int[]]$horas) {
+        $bytes = New-Object byte[] 21
+        for ($d = 0; $d -lt 7; $d++) {
+            $bits = 0
+            foreach ($h in $horas) { $bits = $bits -bor (1 -shl $h) }
+            $bytes[$d*3] = $bits -band 0xFF; $bytes[$d*3+1] = ($bits -shr 8) -band 0xFF; $bytes[$d*3+2] = ($bits -shr 16) -band 0xFF
+        }
+        return $bytes
+    }
+    $bytesCuates   = Get-LogonBytes @(14,15,16,17,18,19,20)
+    $bytesNoCuates = Get-LogonBytes @(21,22,23,0,1,2,3,4,5,6,7)
+    foreach ($u in $Usuarios) {
+        $bytes = if ($u.Departamento -eq "Cuates") {$bytesCuates} else {$bytesNoCuates}
+        $dn    = (Get-ADUser $u.Usuario).DistinguishedName
+        $ldif  = "dn: $dn`nchangetype: modify`nreplace: logonHours`nlogonHours:: $([Convert]::ToBase64String($bytes))`n-"
+        $ldif | Out-File "C:\Scripts\temp_logon.ldf" -Encoding ASCII -Force
+        & ldifde -i -f "C:\Scripts\temp_logon.ldf" -j "C:\Scripts" 2>&1 | Out-Null
+        Write-Host "Horario OK: $($u.Usuario) [$($u.Departamento)]" -ForegroundColor Green
+    }
+}
+
+function New-GPOCierreHorario {
+    if (-not (Get-GPO -Name "GPO-CierreHorario" -ErrorAction SilentlyContinue)) {
+        New-GPO -Name "GPO-CierreHorario" | Out-Null
+        New-GPLink -Name "GPO-CierreHorario" -Target $Global:DominioDN -LinkEnabled Yes | Out-Null
+    }
+    Set-GPRegistryValue -Name "GPO-CierreHorario" `
+        -Key "HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" `
+        -ValueName "EnableForcedLogOff" -Type DWord -Value 1
+    Write-Host "GPO-CierreHorario lista" -ForegroundColor Green
+}
+
+function New-CuotasFSRM {
+    param([array]$Usuarios)
+    foreach ($t in @(@{Nombre="Cuota-5MB-NoCuates";Tam=5MB},@{Nombre="Cuota-10MB-Cuates";Tam=10MB})) {
+        Remove-FsrmQuotaTemplate -Name $t.Nombre -Confirm:$false -ErrorAction SilentlyContinue
+        New-FsrmQuotaTemplate    -Name $t.Nombre -Size $t.Tam -SoftLimit:$false
+        Write-Host "Plantilla: $($t.Nombre) $([int]($t.Tam/1MB))MB HARD" -ForegroundColor Green
+    }
+    foreach ($u in $Usuarios) {
+        $homeDir  = "$Global:HomesBase\$($u.Usuario)"
+        $template = if ($u.Departamento -eq "Cuates") {"Cuota-10MB-Cuates"} else {"Cuota-5MB-NoCuates"}
+        $tam      = if ($u.Departamento -eq "Cuates") {10MB} else {5MB}
+        Remove-FsrmQuota -Path $homeDir -Confirm:$false -ErrorAction SilentlyContinue
+        New-FsrmQuota    -Path $homeDir -Template $template -Size $tam -SoftLimit:$false
+        Write-Host "Cuota $([int]($tam/1MB))MB: $($u.Usuario)" -ForegroundColor Green
+    }
+}
+
+function New-FileScreeningFSRM {
+    param([array]$Usuarios)
+    $fgName = "Archivos-Prohibidos-Tarea08"
+    $stName = "Screen-Multimedia-Ejecutables"
+    Remove-FsrmFileGroup          -Name $fgName -Confirm:$false -ErrorAction SilentlyContinue
+    New-FsrmFileGroup             -Name $fgName -IncludePattern @("*.mp3","*.mp4","*.exe","*.msi")
+    Remove-FsrmFileScreenTemplate -Name $stName -Confirm:$false -ErrorAction SilentlyContinue
+    New-FsrmFileScreenTemplate    -Name $stName -Active:$true -IncludeGroup @($fgName)
+    foreach ($u in $Usuarios) {
+        $homeDir = "$Global:HomesBase\$($u.Usuario)"
+        Remove-FsrmFileScreen -Path $homeDir -Confirm:$false -ErrorAction SilentlyContinue
+        New-FsrmFileScreen    -Path $homeDir -Template $stName -Active:$true
+        Write-Host "FileScreen: $($u.Usuario)" -ForegroundColor Green
+    }
+    Write-Host "File Screening listo" -ForegroundColor Green
+}
+
+function Enable-AppIDSvc {
+    Set-Service   AppIDSvc -StartupType Automatic -ErrorAction SilentlyContinue
+    Start-Service AppIDSvc -ErrorAction SilentlyContinue
+    Write-Host "AppIDSvc: $((Get-Service AppIDSvc).Status)" -ForegroundColor Green
+}
+
+function Invoke-ConfigurarDominio {
+    Import-Module ActiveDirectory, GroupPolicy, FileServerResourceManager
+    $usuarios = Import-Csv $Global:CsvPath 
+    New-OUsYGrupos
+    New-ShareHomes
+    New-UsuariosDesdeCSV  -Usuarios $usuarios
+    Set-HorariosLogon     -Usuarios $usuarios
+    New-GPOCierreHorario
+    New-CuotasFSRM        -Usuarios $usuarios
+    New-FileScreeningFSRM -Usuarios $usuarios
+    Enable-AppIDSvc
+    Write-Host "`n[FASE 3] Configuracion completada." -ForegroundColor Green
+    Invoke-VerificacionFinal
+}
+
+function Invoke-VerificacionFinal {
+    Write-Host "`n===== VERIFICACION FINAL =====" -ForegroundColor Magenta
+    Write-Host "`nUsuarios en AD:" -ForegroundColor Yellow
+    Get-ADUser -Filter * -SearchBase $Global:DominioDN -Properties Department |
+        Where-Object {$_.Department -in @("Cuates","NoCuates")} |
+        Select-Object SamAccountName, Department, Enabled | Format-Table -AutoSize
+    Write-Host "Logon Hours:" -ForegroundColor Yellow
+    $usuarios = Import-Csv $Global:CsvPath
+    foreach ($u in $usuarios) {
+        $adU    = Get-ADUser $u.Usuario -Properties logonHours
+        $estado = if ($adU.logonHours.Count -eq 21) {"OK"} else {"FALTA"}
+        Write-Host "  $($u.Usuario) ($($u.Departamento)): $estado - $($adU.logonHours.Count) bytes"
+    }
+    Write-Host "`nCuotas FSRM:" -ForegroundColor Yellow
+    Get-FsrmQuota | Select-Object Path, @{N="MB";E={[int]($_.Size/1MB)}}, @{N="Tipo";E={if($_.SoftLimit){"SOFT"}else{"HARD"}}} | Format-Table -AutoSize
+    Write-Host "File Screens:" -ForegroundColor Yellow
+    Get-FsrmFileScreen | Select-Object Path, Active | Format-Table -AutoSize
+    Write-Host "GPOs activas:" -ForegroundColor Yellow
+    (Get-GPInheritance -Target $Global:DominioDN).GpoLinks | Select-Object DisplayName, Enabled | Format-Table
+    Write-Host "`nServidor listo." -ForegroundColor Green
+}
